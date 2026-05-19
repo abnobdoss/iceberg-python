@@ -861,6 +861,18 @@ class Transaction:
         if not when_matched_update_all and not when_not_matched_insert_all:
             raise ValueError("no upsert options selected...exiting")
 
+        if not case_sensitive:
+            all_names = [field.name for field in self.table_metadata.schema().fields]
+            lower_names = [n.lower() for n in all_names]
+            if len(set(lower_names)) != len(all_names):
+                import collections
+
+                collisions = [item for item, count in collections.Counter(lower_names).items() if count > 1]
+                raise ValueError(
+                    f"Case-insensitive upsert is ambiguous for this table because of name collisions: {', '.join(collisions)}. "
+                    "Please use case_sensitive=True or rename the columns."
+                )
+
         # Ensure all top-level table columns are present in the source to avoid silent data loss.
         if case_sensitive:
             table_cols = {field.name for field in self.table_metadata.schema().fields}
