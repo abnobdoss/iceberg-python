@@ -154,10 +154,11 @@ def get_rows_to_update(source_table: pa.Table, target_table: pa.Table, join_cols
         ) from None
 
     # Step 1: Prepare source index with join keys and a marker index
-    # Cast to target table schema, so we can do the join
+    # Cast only the join keys to target table types, so we can do the join
     # See: https://github.com/apache/arrow/issues/37542
+    target_key_schema = pa.schema([target_table.schema.field(col) for col in join_cols])
     source_index = _augment_for_null_safe_join(
-        source_table.cast(target_table.schema).select(join_cols_set), join_cols_set
+        source_table.select(join_cols_set).cast(target_key_schema), join_cols_set
     ).append_column(SOURCE_INDEX_COLUMN_NAME, pa.array(range(len(source_table))))
 
     # Step 2: Prepare target index with join keys and a marker
