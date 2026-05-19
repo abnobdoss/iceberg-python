@@ -861,6 +861,17 @@ class Transaction:
         if not when_matched_update_all and not when_not_matched_insert_all:
             raise ValueError("no upsert options selected...exiting")
 
+        # Ensure all top-level table columns are present in the source to avoid silent data loss.
+        table_cols = {field.name for field in self.table_metadata.schema().fields}
+        source_cols = set(df.column_names)
+        missing_cols = table_cols - source_cols
+        if missing_cols:
+            raise ValueError(
+                f"Partial schema updates are not yet supported. The source dataframe is missing "
+                f"the following table columns: {', '.join(sorted(missing_cols))}. "
+                "Please provide all columns to avoid accidental data loss."
+            )
+
         if upsert_util.has_duplicate_rows(df, join_cols):
             raise ValueError("Duplicate rows found in source dataset based on the key columns. No upsert executed")
 
