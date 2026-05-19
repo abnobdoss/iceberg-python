@@ -862,8 +862,13 @@ class Transaction:
             raise ValueError("no upsert options selected...exiting")
 
         # Ensure all top-level table columns are present in the source to avoid silent data loss.
-        table_cols = {field.name for field in self.table_metadata.schema().fields}
-        source_cols = set(df.column_names)
+        if case_sensitive:
+            table_cols = {field.name for field in self.table_metadata.schema().fields}
+            source_cols = set(df.column_names)
+        else:
+            table_cols = {field.name.lower() for field in self.table_metadata.schema().fields}
+            source_cols = {name.lower() for name in df.column_names}
+
         missing_cols = table_cols - source_cols
         if missing_cols:
             raise ValueError(
