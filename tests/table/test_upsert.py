@@ -325,7 +325,12 @@ def test_key_cols_misaligned(catalog: Catalog) -> None:
 
     df_src = ctx.sql("select 1 as item_id, date '2021-05-01' as order_date, 'B' as order_type").to_arrow_table()
 
-    with pytest.raises(ValueError, match="PyArrow table contains more columns: item_id"):
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Partial schema updates are not yet supported. The source dataframe is missing the following table columns: order_id"
+        ),
+    ):
         table.upsert(df=df_src, join_cols=["order_id"])
 
 
@@ -1203,3 +1208,70 @@ def test_upsert_extra_columns_fails(catalog: Catalog) -> None:
 
     with pytest.raises(ValueError, match="PyArrow table contains more columns: unknown"):
         table.upsert(source, join_cols=["k"])
+
+
+@pytest.mark.parametrize(
+    "table_fields, source_fields, case_sensitive, expected_error, match",
+    [
+        # 1. Collision Fail: Table has 'ID' and 'id', case_sensitive=False -> Ambiguity Error
+        (
+            [("ID", pa.int32()), ("id", pa.string())],
+            [("ID", pa.int32()), ("id", pa.string())],
+            False,
+            ValueError,
+            "Case-insensitive upsert is ambiguous for this table because of name collisions: id",
+        ),
+        # 2. Collision Success: Table has 'ID' and 'id', case_sensitive=True -> OK
+        (
+            [("ID", pa.int32()), ("id", pa.string())],
+            [("ID", pa.int32()), ("id", pa.string())],
+            True,
+            None,
+            None,
+        ),
+        # 3. Missing Column (Case-Insensitive): Table has 'id', 'data',
+        # Source has 'ID' only, case_sensitive=False -> Missing 'data'
+        (
+            [("id", pa.int32()), ("data", pa.string())],
+            [("ID", pa.int32())],
+            False,
+            ValueError,
+            "The source dataframe is missing the following table columns: data",
+        ),
+        # 4. Standard Mismatch: Table has 'id', Source has 'ID', case_sensitive=True -> Guardrail catches missing 'id'
+        (
+            [("id", pa.int32())],
+            [("ID", pa.int32())],
+            True,
+            ValueError,
+            "The source dataframe is missing the following table columns: id",
+        ),
+    ],
+    ids=["collision_fail", "collision_ok", "missing_insensitive", "standard_mismatch"],
+)
+def test_upsert_case_sensitivity_scenarios(
+    catalog: Catalog,
+    table_fields: list[tuple[str, pa.DataType]],
+    source_fields: list[tuple[str, pa.DataType]],
+    case_sensitive: bool,
+    expected_error: type[Exception] | None,
+    match: str | None,
+) -> None:
+    """Verify that upsert correctly handles case-sensitivity edge cases like name collisions and mismatched casings."""
+    identifier = "default.test_upsert_case_sensitivity_scenarios"
+    try:
+        catalog.drop_table(identifier)
+    except NoSuchTableError:
+        pass
+
+    table = catalog.create_table(identifier, pa.schema(table_fields))
+    source = pa.Table.from_pylist(
+        [{f[0]: (1 if f[1] == pa.int32() else "val") for f in source_fields}],
+        schema=pa.schema(source_fields),
+    )
+
+    if expected_error:
+        with pytest.raises(expected_error, match=match):
+            table.upsert(source, join_cols=[table_fields[0][0]], case_sensitive=case_sensitive)
+    else:
+        table.upsert(source, join_cols=[table_fields[0][0]], case_sensitive=case_sensitive)

@@ -784,15 +784,21 @@ class Transaction:
 
         from pyiceberg.io.pyarrow import _check_pyarrow_schema_compatible, schema_to_pyarrow
 
-        downcast_ns_timestamp_to_us = Config().get_bool(DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE) or False
-        _check_pyarrow_schema_compatible(
-            self.table_metadata.schema(),
-            provided_schema=df.schema,
-            downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us,
-            format_version=self.table_metadata.format_version,
-        )
+        # Guardrail: Check for case-insensitive name collisions in the table schema if case_sensitive=False.
+        # This prevents ambiguity and accidental data loss where 'ID' and 'id' might be confused.
+        if not case_sensitive:
+            all_names = [field.name for field in self.table_metadata.schema().fields]
+            lower_names = [n.lower() for n in all_names]
+            if len(set(lower_names)) != len(all_names):
+                import collections
 
-        # Ensure all top-level table columns are present in the source to avoid silent data loss.
+                collisions = [item for item, count in collections.Counter(lower_names).items() if count > 1]
+                raise ValueError(
+                    f"Case-insensitive upsert is ambiguous for this table because of name collisions: {', '.join(collisions)}. "
+                    "Please use case_sensitive=True or rename the columns."
+                )
+
+        # Guardrail: Enforce total schema equality (top-level) to prevent silent data loss.
         if case_sensitive:
             table_cols = {field.name for field in self.table_metadata.schema().fields}
             source_cols = set(df.column_names)
@@ -807,6 +813,14 @@ class Transaction:
                 f"the following table columns: {', '.join(sorted(missing_cols))}. "
                 "Please provide all columns to avoid accidental data loss."
             )
+
+        downcast_ns_timestamp_to_us = Config().get_bool(DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE) or False
+        _check_pyarrow_schema_compatible(
+            self.table_metadata.schema(),
+            provided_schema=df.schema,
+            downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us,
+            format_version=self.table_metadata.format_version,
+        )
 
         table_arrow_schema = schema_to_pyarrow(self.table_metadata.schema(), include_field_ids=False)
 
