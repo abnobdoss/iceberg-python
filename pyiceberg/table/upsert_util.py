@@ -153,15 +153,15 @@ def get_rows_to_update(source_table: pa.Table, target_table: pa.Table, join_cols
             f"DataFrames, and cannot be used as column names"
         ) from None
 
-    # Step 1: Prepare source index with join keys and a marker index
-    # Cast only the join keys to target table types, so we can do the join
+    # Step 1: Prepare source index with join keys and a marker index.
+    # Select and cast using the list order to ensure schema alignment with target_key_schema.
     # See: https://github.com/apache/arrow/issues/37542
     target_key_schema = pa.schema([target_table.schema.field(col) for col in join_cols])
     source_index = _augment_for_null_safe_join(
-        source_table.select(join_cols_set).cast(target_key_schema), join_cols_set
+        source_table.select(join_cols).cast(target_key_schema), join_cols_set
     ).append_column(SOURCE_INDEX_COLUMN_NAME, pa.array(range(len(source_table))))
 
-    # Step 2: Prepare target index with join keys and a marker
+    # Step 2: Prepare target index with join keys and a marker.
     target_index = _augment_for_null_safe_join(target_table.select(join_cols_set), join_cols_set).append_column(
         TARGET_INDEX_COLUMN_NAME, pa.array(range(len(target_table)))
     )
@@ -170,7 +170,9 @@ def get_rows_to_update(source_table: pa.Table, target_table: pa.Table, join_cols
     join_keys = list(join_cols_set) + [f"__isnull_{c}" for c in join_cols_set]
     matching_indices = source_index.join(target_index, keys=join_keys, join_type="inner")
 
-    # Step 4: Compare all rows using Python
+    # Step 4: Compare rows in Python to find actual changes.
+    # We use Python here because PyArrow (as of v18) cannot perform vectorized
+    # equality checks on nested types (structs/lists).
     to_update_indices = []
     for source_idx, target_idx in zip(
         matching_indices[SOURCE_INDEX_COLUMN_NAME].to_pylist(),
@@ -187,7 +189,7 @@ def get_rows_to_update(source_table: pa.Table, target_table: pa.Table, join_cols
                 to_update_indices.append(source_idx)
                 break
 
-    # Step 5: Take rows from source table using the indices and cast to target schema
+    # Step 5: Take rows from source table using the indices and return as a Table.
     if to_update_indices:
         return source_table.take(to_update_indices)
     else:
