@@ -61,21 +61,59 @@ def create_file_match_filter(df: pyarrow_table, join_cols: list[str]) -> Boolean
 
 
 def create_match_filter(df: pyarrow_table, join_cols: list[str]) -> BooleanExpression:
+    """Exact predicate over the source join keys; null in a key compares with IsNull."""
     unique_keys = df.select(join_cols).group_by(join_cols).aggregate([])
+    if len(unique_keys) == 0:
+        return AlwaysFalse()
 
     if len(join_cols) == 1:
-        return In(join_cols[0], unique_keys[0].to_pylist())
-    else:
-        filters = [
-            functools.reduce(operator.and_, [EqualTo(col, row[col]) for col in join_cols]) for row in unique_keys.to_pylist()
-        ]
+        col = join_cols[0]
+        vals = unique_keys[0].to_pylist()
+        non_null = [v for v in vals if v is not None]
+        if not non_null:
+            return IsNull(col)
+        in_pred: BooleanExpression = In(col, non_null)
+        return in_pred if len(non_null) == len(vals) else in_pred | IsNull(col)
 
-        if len(filters) == 0:
-            return AlwaysFalse()
-        elif len(filters) == 1:
-            return filters[0]
-        else:
-            return Or(*filters)
+    row_preds = [
+        functools.reduce(
+            operator.and_,
+            [EqualTo(c, row[c]) if row[c] is not None else IsNull(c) for c in join_cols],
+        )
+        for row in unique_keys.to_pylist()
+    ]
+    return row_preds[0] if len(row_preds) == 1 else Or(*row_preds)
+
+
+def _default_scalar(arrow_type: pa.DataType) -> pa.Scalar:
+    """Return a fixed non-null scalar of the given type for use as a null sentinel."""
+    if pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type):
+        return pa.scalar("", type=arrow_type)
+    if pa.types.is_binary(arrow_type) or pa.types.is_large_binary(arrow_type):
+        return pa.scalar(b"", type=arrow_type)
+    if pa.types.is_fixed_size_binary(arrow_type):
+        return pa.scalar(b"\x00" * arrow_type.byte_width, type=arrow_type)
+    if pa.types.is_boolean(arrow_type):
+        return pa.scalar(False, type=arrow_type)
+    return pa.scalar(0, type=arrow_type)
+
+
+def _augment_for_null_safe_join(table: pa.Table, join_cols: set[str]) -> pa.Table:
+    """Augment join columns so pyarrow inner join treats null↔null as a match.
+
+    Replaces nulls in each join col with a fixed same-type sentinel and appends an
+    `__isnull_<col>` indicator. Joining on (col, indicator) then matches null rows to
+    null rows. The sentinel is type-derived (not data-derived) so both sides agree.
+    """
+    for col in join_cols:
+        if f"__isnull_{col}" in join_cols:
+            raise ValueError(f"join column '__isnull_{col}' collides with the reserved null-indicator name")
+    out = table
+    for col in join_cols:
+        arr = table.column(col)
+        out = out.set_column(out.column_names.index(col), col, pc.fill_null(arr, _default_scalar(arr.type)))
+        out = out.append_column(f"__isnull_{col}", pc.is_null(arr))
+    return out
 
 
 def has_duplicate_rows(df: pyarrow_table, join_cols: list[str]) -> bool:
@@ -118,17 +156,18 @@ def get_rows_to_update(source_table: pa.Table, target_table: pa.Table, join_cols
     # Step 1: Prepare source index with join keys and a marker index
     # Cast to target table schema, so we can do the join
     # See: https://github.com/apache/arrow/issues/37542
-    source_index = (
-        source_table.cast(target_table.schema)
-        .select(join_cols_set)
-        .append_column(SOURCE_INDEX_COLUMN_NAME, pa.array(range(len(source_table))))
-    )
+    source_index = _augment_for_null_safe_join(
+        source_table.cast(target_table.schema).select(join_cols_set), join_cols_set
+    ).append_column(SOURCE_INDEX_COLUMN_NAME, pa.array(range(len(source_table))))
 
     # Step 2: Prepare target index with join keys and a marker
-    target_index = target_table.select(join_cols_set).append_column(TARGET_INDEX_COLUMN_NAME, pa.array(range(len(target_table))))
+    target_index = _augment_for_null_safe_join(target_table.select(join_cols_set), join_cols_set).append_column(
+        TARGET_INDEX_COLUMN_NAME, pa.array(range(len(target_table)))
+    )
 
-    # Step 3: Perform an inner join to find which rows from source exist in target
-    matching_indices = source_index.join(target_index, keys=list(join_cols_set), join_type="inner")
+    # Step 3: Inner join on (key value, is-null indicator) per col — matches null↔null.
+    join_keys = list(join_cols_set) + [f"__isnull_{c}" for c in join_cols_set]
+    matching_indices = source_index.join(target_index, keys=join_keys, join_type="inner")
 
     # Step 4: Compare all rows using Python
     to_update_indices = []

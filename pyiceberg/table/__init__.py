@@ -917,8 +917,9 @@ class Transaction:
                 expr_match_bound = bind(self.table_metadata.schema(), expr_match, case_sensitive=case_sensitive)
                 expr_match_arrow = expression_to_pyarrow(expr_match_bound)
 
-                # Filter rows per batch.
-                rows_to_insert = rows_to_insert.filter(~expr_match_arrow)
+                # Filter rows per batch. Treat null match (source key null vs non-null target key)
+                # as "no match" so the row reaches the insert path instead of being dropped.
+                rows_to_insert = rows_to_insert.filter(expr_match_arrow.is_null() | ~expr_match_arrow)
 
         update_row_cnt = 0
         insert_row_cnt = 0
