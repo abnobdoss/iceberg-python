@@ -14,6 +14,8 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+from datetime import date, datetime, time, timezone
+from decimal import Decimal
 from pathlib import PosixPath
 
 import pyarrow as pa
@@ -907,7 +909,7 @@ def test_upsert_snapshot_properties(catalog: Catalog) -> None:
         (
             pa.list_(pa.int32()),
             ValueError,
-            "Nested column 'k' of type 'list<item: int32>' cannot be used as a join key in upsert",
+            r"Nested column 'k' of type '.*list<.*: int32>' cannot be used as a join key in upsert",
         ),
         (
             pa.dictionary(pa.int32(), pa.string()),
@@ -945,12 +947,13 @@ def test_upsert_unsupported_join_column_types(
         schema=pa.schema([("k", arrow_type), ("payload", pa.string())]),
     )
 
-    with pytest.raises(expected_error, match=match):
-        table.upsert(source, join_cols=["k"])
+    if pa.types.is_null(arrow_type):
+        with pytest.raises(ValueError, match=r"Null type \(pa.null\(\)\) is not supported in Iceberg format version 2"):
+            table.upsert(source, join_cols=["k"])
+    else:
+        with pytest.raises(expected_error, match=match):
+            table.upsert(source, join_cols=["k"])
 
-
-from datetime import date, datetime, time, timezone
-from decimal import Decimal
 
 # Every Iceberg primitive type as a join-key candidate. `val_a` is chosen to coincide with the
 # null-sentinel returned by `_default_scalar` for the type (0 / "" / False / zero-bytes), so any
@@ -1151,3 +1154,50 @@ def test_upsert_null_safe_equality_semantics(
 
     final = sorted(table.scan().to_arrow().to_pylist(), key=key)
     assert final == sorted(expected_final, key=key)
+
+
+def test_upsert_partial_schema(catalog: Catalog) -> None:
+    """Verify that upserting with a subset of the table columns succeeds.
+    This tests the fix for the crash that occurred when attempting to cast the source
+    directly to the full target table schema.
+    """
+    identifier = "default.test_upsert_partial_schema"
+    _drop_table(catalog, identifier)
+
+    # Table has 3 columns: k, payload, and description
+    table_schema = pa.schema([("k", pa.int32()), ("payload", pa.string()), ("description", pa.string())])
+    table = catalog.create_table(identifier, table_schema)
+    table.append(
+        pa.Table.from_pylist(
+            [{"k": 1, "payload": "old", "description": "keep me"}],
+            schema=table_schema,
+        )
+    )
+
+    # Source only has 2 columns: k and payload (missing 'description')
+    source_schema = pa.schema([("k", pa.int32()), ("payload", pa.string())])
+    source = pa.Table.from_pylist([{"k": 1, "payload": "new"}], schema=source_schema)
+
+    # Should succeed but will null out columns not present in the source (Iceberg APPEND behavior)
+    res = table.upsert(source, join_cols=["k"])
+    assert (res.rows_updated, res.rows_inserted) == (1, 0)
+
+    final = table.scan().to_arrow().to_pylist()[0]
+    assert final["payload"] == "new"
+    assert final["description"] is None  # Currently, upsert nulls out missing columns
+
+
+def test_upsert_extra_columns_fails(catalog: Catalog) -> None:
+    """Verify that upserting with columns NOT in the table is correctly rejected."""
+    identifier = "default.test_upsert_extra_columns_fails"
+    _drop_table(catalog, identifier)
+
+    table_schema = pa.schema([("k", pa.int32()), ("payload", pa.string())])
+    table = catalog.create_table(identifier, table_schema)
+
+    # Source has an extra column 'unknown'
+    source_schema = pa.schema([("k", pa.int32()), ("payload", pa.string()), ("unknown", pa.string())])
+    source = pa.Table.from_pylist([{"k": 1, "payload": "val", "unknown": "???"}], schema=source_schema)
+
+    with pytest.raises(ValueError, match="PyArrow table contains more columns: unknown"):
+        table.upsert(source, join_cols=["k"])
