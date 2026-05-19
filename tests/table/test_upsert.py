@@ -1178,13 +1178,15 @@ def test_upsert_partial_schema(catalog: Catalog) -> None:
     source_schema = pa.schema([("k", pa.int32()), ("payload", pa.string())])
     source = pa.Table.from_pylist([{"k": 1, "payload": "new"}], schema=source_schema)
 
-    # Should succeed but will null out columns not present in the source (Iceberg APPEND behavior)
-    res = table.upsert(source, join_cols=["k"])
-    assert (res.rows_updated, res.rows_inserted) == (1, 0)
-
-    final = table.scan().to_arrow().to_pylist()[0]
-    assert final["payload"] == "new"
-    assert final["description"] is None  # Currently, upsert nulls out missing columns
+    # Should fail with a clear message explaining that partial schemas are not yet supported
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Partial schema updates are not yet supported. "
+            "The source dataframe is missing the following table columns: description"
+        ),
+    ):
+        table.upsert(source, join_cols=["k"])
 
 
 def test_upsert_extra_columns_fails(catalog: Catalog) -> None:

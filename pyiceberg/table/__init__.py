@@ -792,6 +792,17 @@ class Transaction:
             format_version=self.table_metadata.format_version,
         )
 
+        # Ensure all top-level table columns are present in the source to avoid silent data loss.
+        table_cols = {field.name for field in self.table_metadata.schema().fields}
+        source_cols = set(df.column_names)
+        missing_cols = table_cols - source_cols
+        if missing_cols:
+            raise ValueError(
+                f"Partial schema updates are not yet supported. The source dataframe is missing "
+                f"the following table columns: {', '.join(sorted(missing_cols))}. "
+                "Please provide all columns to avoid accidental data loss."
+            )
+
         table_arrow_schema = schema_to_pyarrow(self.table_metadata.schema(), include_field_ids=False)
 
         for col in join_cols:
