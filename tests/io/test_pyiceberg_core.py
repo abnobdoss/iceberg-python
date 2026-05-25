@@ -26,6 +26,7 @@ import pytest
 from pyiceberg.expressions import And, EqualTo, IsNull, StartsWith
 from pyiceberg.io import FileIO, InputFile, OutputFile
 from pyiceberg.io.pyiceberg_core import (
+    arrow_batch_reader_from_pyiceberg_core,
     can_read_projected_schema_with_pyiceberg_core,
     delete_file_to_pyiceberg_core,
     expression_to_pyiceberg_core,
@@ -94,6 +95,11 @@ class CoreReference(CoreObject):
         return self._predicate("is_null")
 
 
+class CoreReader(CoreObject):
+    def read(self, *args: Any, **kwargs: Any) -> Any:
+        return CoreObject(*args, **kwargs)
+
+
 class FakeFileIO(FileIO):
     def new_input(self, location: str) -> InputFile:
         raise NotImplementedError
@@ -122,6 +128,7 @@ def fake_pyiceberg_core(monkeypatch: pytest.MonkeyPatch) -> None:
     scan: Any = ModuleType("pyiceberg_core.scan")
     scan.DeleteFile = CoreObject
     scan.FileScanTask = CoreObject
+    scan.ArrowReader = CoreReader
 
     monkeypatch.setitem(sys.modules, "pyiceberg_core", root)
     monkeypatch.setitem(sys.modules, "pyiceberg_core.schema", schema)
@@ -322,3 +329,44 @@ def test_file_scan_task_to_pyiceberg_core_requires_partition_spec_for_partitione
 
     with pytest.raises(ValueError, match="partition_spec is required"):
         file_scan_task_to_pyiceberg_core(FileScanTask(data_file), simple_schema)
+
+
+def test_arrow_batch_reader_from_pyiceberg_core_with_partition_and_name_mapping(simple_schema: Schema) -> None:
+    data_file = DataFile.from_args(
+        content=DataFileContent.DATA,
+        file_path="s3://warehouse/table/data.parquet",
+        file_format="PARQUET",
+        partition=Record("bucket-1"),
+        record_count=10,
+        file_size_in_bytes=1234,
+        column_sizes={},
+        value_counts={},
+        null_value_counts={},
+        nan_value_counts={},
+        lower_bounds={},
+        upper_bounds={},
+    )
+    data_file.spec_id = 1
+    partition_spec = PartitionSpec(PartitionField(source_id=1, field_id=1000, transform=IdentityTransform(), name="id"))
+    name_mapping = NameMapping([MappedField(field_id=1, names=["id"])])
+
+    task = FileScanTask(data_file)
+
+    reader = arrow_batch_reader_from_pyiceberg_core(
+        FakeFileIO({}),
+        [task],
+        simple_schema,
+        simple_schema,
+        {1: partition_spec},
+        name_mapping,
+    )
+
+    assert isinstance(reader, CoreObject)
+    assert len(reader.args) == 2
+    assert isinstance(reader.args[0], CoreSchema)
+    assert isinstance(reader.args[1], list)
+    assert len(reader.args[1]) == 1
+
+    converted_task = reader.args[1][0]
+    assert converted_task.kwargs["partition_spec"] == partition_spec.model_dump_json(by_alias=True, exclude_none=True)
+    assert converted_task.kwargs["name_mapping"] == name_mapping.model_dump_json(by_alias=True, exclude_none=True)
