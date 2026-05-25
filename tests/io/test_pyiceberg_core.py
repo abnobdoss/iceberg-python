@@ -370,3 +370,35 @@ def test_arrow_batch_reader_from_pyiceberg_core_with_partition_and_name_mapping(
     converted_task = reader.args[1][0]
     assert converted_task.kwargs["partition_spec"] == partition_spec.model_dump_json(by_alias=True, exclude_none=True)
     assert converted_task.kwargs["name_mapping"] == name_mapping.model_dump_json(by_alias=True, exclude_none=True)
+
+
+def test_arrow_batch_reader_from_pyiceberg_core_with_limit(simple_schema: Schema) -> None:
+    data_file = DataFile.from_args(
+        content=DataFileContent.DATA,
+        file_path="s3://warehouse/table/data.parquet",
+        file_format="PARQUET",
+        partition=Record(),
+        record_count=10,
+        file_size_in_bytes=1234,
+        column_sizes={},
+        value_counts={},
+        null_value_counts={},
+        nan_value_counts={},
+        lower_bounds={},
+        upper_bounds={},
+    )
+    data_file.spec_id = 0
+    task = FileScanTask(data_file)
+
+    reader = arrow_batch_reader_from_pyiceberg_core(
+        FakeFileIO({}),
+        [task],
+        simple_schema,
+        simple_schema,
+        {},
+        None,
+        limit=5,
+    )
+
+    assert isinstance(reader, CoreObject)
+    assert reader.kwargs.get("max_rows") == 5

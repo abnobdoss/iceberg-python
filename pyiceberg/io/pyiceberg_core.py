@@ -311,6 +311,7 @@ def arrow_batch_reader_from_pyiceberg_core(
     partition_specs: dict[int, PartitionSpec],
     name_mapping: NameMapping | None,
     case_sensitive: bool = True,
+    limit: int | None = None,
 ) -> Any:
     """Read PyIceberg scan tasks through pyiceberg-core's ArrowReader."""
     core_tasks = [
@@ -327,4 +328,4 @@ def arrow_batch_reader_from_pyiceberg_core(
     ]
 
     reader = _core_module("scan").ArrowReader(file_io_to_pyiceberg_core(file_io))
-    return reader.read(schema_to_pyiceberg_core(projected_schema), core_tasks)
+    return reader.read(schema_to_pyiceberg_core(projected_schema), core_tasks, max_rows=limit)

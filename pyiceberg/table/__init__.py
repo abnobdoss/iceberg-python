@@ -2244,7 +2244,7 @@ class DataScan(TableScan):
         from pyiceberg.io.pyarrow import ArrowScan, schema_to_pyarrow
 
         projected_schema = self.projection()
-        if self.limit is None and os.environ.get(PYICEBERG_RUST_ARROW_SCAN, "").lower() in {"1", "true", "yes"}:
+        if os.environ.get(PYICEBERG_RUST_ARROW_SCAN, "").lower() in {"1", "true", "yes"}:
             from pyiceberg.io.pyiceberg_core import (
                 arrow_batch_reader_from_pyiceberg_core,
                 can_read_projected_schema_with_pyiceberg_core,
@@ -2262,6 +2262,7 @@ class DataScan(TableScan):
                         self.table_metadata.specs(),
                         self.table_metadata.name_mapping(),
                         self.case_sensitive,
+                        limit=self.limit,
                     )
                 except (ModuleNotFoundError, NotImplementedError, ValueError) as exc:
                     warnings.warn(
