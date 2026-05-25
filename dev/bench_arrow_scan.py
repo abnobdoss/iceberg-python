@@ -39,6 +39,7 @@ import subprocess
 import sys
 import time
 import tracemalloc
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -82,6 +83,12 @@ class RunResult:
     peak_rss_mb: float
     maxrss_mb: float
     tracemalloc_peak_mb: float
+
+
+FALLBACK_WARNING_MARKERS = (
+    "Falling back to PyArrow scan because pyiceberg-core cannot handle this scan",
+    "Falling back to native task-based scan because Rust-planned scan failed",
+)
 
 
 def _catalog_props(config: CatalogConfig) -> dict[str, str]:
@@ -254,12 +261,23 @@ def _run_scan(config: CatalogConfig, scenario: Scenario, engine: str, validate_o
     batches = 0
     checksum = 0
     columns: list[str] | None = None
-    for batch in table.scan(**scan_kwargs).to_arrow_batch_reader():
-        if columns is None:
-            columns = batch.schema.names
-        rows += batch.num_rows
-        batches += 1
-        checksum += _batch_checksum(batch)
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        for batch in table.scan(**scan_kwargs).to_arrow_batch_reader():
+            if columns is None:
+                columns = batch.schema.names
+            rows += batch.num_rows
+            batches += 1
+            checksum += _batch_checksum(batch)
+
+    fallback_warnings = [
+        str(warning.message)
+        for warning in caught_warnings
+        if any(marker in str(warning.message) for marker in FALLBACK_WARNING_MARKERS)
+    ]
+    if fallback_warnings:
+        raise RuntimeError(f"{engine} {scenario.name} used a fallback scan path: {fallback_warnings}")
+
     elapsed_ms = (time.perf_counter() - start) * 1000
     _, peak = tracemalloc.get_traced_memory()
     rss_after_mb = _current_rss_mb()
