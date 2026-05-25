@@ -599,3 +599,49 @@ def test_arrow_batch_reader_from_pyiceberg_core_planned_star_fields(simple_schem
         limit=None,
     )
     assert reader.kwargs["selected_fields"] is None
+
+
+def test_rust_planned_arrow_scan_bypasses_python_planning(simple_schema: Schema, monkeypatch: pytest.MonkeyPatch) -> None:
+    from pyiceberg.catalog.noop import NoopCatalog
+    from pyiceberg.table import DataScan, Table
+    from pyiceberg.table.metadata import TableMetadataV2
+
+    metadata = TableMetadataV2(
+        location="s3://warehouse/table",
+        last_sequence_number=1,
+        last_updated_ms=1600000000000,
+        last_column_id=2,
+        schemas=[simple_schema],
+        current_schema_id=simple_schema.schema_id,
+        partition_specs=[PartitionSpec()],
+        default_spec_id=0,
+        last_partition_id=1000,
+        default_sort_order_id=0,
+        sort_orders=[],
+        properties={},
+        snapshots=[],
+        snapshot_log=[],
+        metadata_log=[],
+    )
+
+    table = Table(
+        identifier=("database", "table"),
+        metadata=metadata,
+        metadata_location=f"{metadata.location}/uuid.metadata.json",
+        io=FakeFileIO({}),
+        catalog=NoopCatalog("NoopCatalog"),
+    )
+
+    scan = table.scan()
+
+    # Monkeypatch DataScan.plan_files to raise an error
+    def mock_plan_files(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("Python planning should not be called!")
+
+    monkeypatch.setattr(DataScan, "plan_files", mock_plan_files)
+    monkeypatch.setenv("PYICEBERG_RUST_PLANNED_ARROW_SCAN", "1")
+
+    # The scan should succeed using the fake planned reader, without calling Python planning
+    reader = scan.to_arrow_batch_reader()
+    assert isinstance(reader, CoreObject)
+    assert CoreTable.last_init is not None
