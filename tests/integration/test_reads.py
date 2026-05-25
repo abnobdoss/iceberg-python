@@ -1272,3 +1272,106 @@ def test_scan_source_field_missing_in_spec(catalog: Catalog, spark: SparkSession
 
     table = catalog.load_table(identifier)
     assert len(list(table.scan().plan_files())) == 3
+
+
+HAS_PYICEBERG_CORE = False
+try:
+    import importlib.util  # noqa: E402
+
+    if importlib.util.find_spec("pyiceberg_core") is not None:
+        import pyiceberg_core.scan  # noqa: F401
+
+        HAS_PYICEBERG_CORE = True
+except (ImportError, NotImplementedError):
+    pass
+
+requires_pyiceberg_core = pytest.mark.skipif(
+    not HAS_PYICEBERG_CORE, reason="pyiceberg-core is not installed or lacks native scan bindings"
+)
+
+
+import contextlib  # noqa: E402
+import os  # noqa: E402
+from collections.abc import Iterator  # noqa: E402
+from typing import Any  # noqa: E402
+
+
+@contextlib.contextmanager
+def env_var(key: str, value: str) -> Iterator[None]:
+    old_value = os.environ.get(key)
+    os.environ[key] = value
+    try:
+        yield
+    finally:
+        if old_value is None:
+            del os.environ[key]
+        else:
+            os.environ[key] = old_value
+
+
+@pytest.mark.integration
+@requires_pyiceberg_core
+@pytest.mark.parametrize("catalog", [lf("session_catalog_hive"), lf("session_catalog")])
+def test_native_arrow_scan_comparisons(catalog: Catalog) -> None:
+    # 1. Unpartitioned table
+    table_limit = catalog.load_table("default.test_limit")
+
+    # 2. Partitioned table
+    table_partitioned = catalog.load_table("default.test_partitioned_by_hours")
+
+    # 3. Table with positional deletes
+    try:
+        table_deletes = catalog.load_table("default.test_positional_mor_deletes_v2")
+    except NoSuchTableError:
+        table_deletes = None
+
+    scans = [
+        # Unpartitioned table scans
+        table_limit.scan(),
+        table_limit.scan(selected_fields=("idx",)),
+        table_limit.scan(row_filter="idx > 5", selected_fields=("idx",)),
+        table_limit.scan(limit=3),
+        table_limit.scan(limit=0),
+        table_limit.scan(limit=999),
+        # Partitioned table scans
+        table_partitioned.scan(),
+        table_partitioned.scan(selected_fields=("ts",)),
+    ]
+    if table_deletes is not None:
+        scans.extend(
+            [
+                table_deletes.scan(),
+                table_deletes.scan(row_filter="letter >= 'e'", limit=2),
+            ]
+        )
+
+    for scan in scans:
+        # Standard PyArrow scan path
+        with env_var("PYICEBERG_RUST_ARROW_SCAN", "0"):
+            pyarrow_table = scan.to_arrow()
+            pyarrow_reader_table = scan.to_arrow_batch_reader().read_all()
+
+        # Native Rust-backed scan path
+        with env_var("PYICEBERG_RUST_ARROW_SCAN", "1"):
+            native_table = scan.to_arrow()
+            native_reader_table = scan.to_arrow_batch_reader().read_all()
+
+        # Check schemas match (ignoring top-level schema metadata)
+        assert pyarrow_table.schema.remove_metadata() == native_table.schema.remove_metadata()
+        assert pyarrow_reader_table.schema.remove_metadata() == native_reader_table.schema.remove_metadata()
+
+        # Convert to list of dicts to do order-independent comparison
+        pydict_pyarrow = pyarrow_table.to_pydict()
+        pydict_native = native_table.to_pydict()
+
+        rows_pyarrow = [{k: v[i] for k, v in pydict_pyarrow.items()} for i in range(len(pyarrow_table))]
+        rows_native = [{k: v[i] for k, v in pydict_native.items()} for i in range(len(native_table))]
+
+        def sort_key(row: dict[str, Any]) -> list[tuple[str, str]]:
+            return sorted((k, str(v)) for k, v in row.items())
+
+        assert sorted(rows_pyarrow, key=sort_key) == sorted(rows_native, key=sort_key)
+
+        # Check table equals reader
+        assert pyarrow_table.equals(pyarrow_reader_table)
+        assert native_table.equals(native_reader_table)
