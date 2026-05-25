@@ -2699,29 +2699,33 @@ def bound_reference_uuid() -> BoundReference:
 
 
 @pytest.fixture(scope="session")
-def session_catalog() -> Catalog:
+def session_catalog(request: pytest.FixtureRequest) -> Catalog:
     return load_catalog(
         "local",
         **{
             "type": "rest",
             "uri": "http://localhost:8181",
-            "s3.endpoint": "http://localhost:9000",
+            "s3.endpoint": request.config.getoption("--s3.endpoint"),
             "s3.access-key-id": "admin",
             "s3.secret-access-key": "password",
+            "s3.region": "us-east-1",
+            "s3.force-virtual-addressing": "false",
         },
     )
 
 
 @pytest.fixture(scope="session")
-def session_catalog_hive() -> Catalog:
+def session_catalog_hive(request: pytest.FixtureRequest) -> Catalog:
     return load_catalog(
         "local",
         **{
             "type": "hive",
             "uri": "thrift://localhost:9083",
-            "s3.endpoint": "http://localhost:9000",
+            "s3.endpoint": request.config.getoption("--s3.endpoint"),
             "s3.access-key-id": "admin",
             "s3.secret-access-key": "password",
+            "s3.region": "us-east-1",
+            "s3.force-virtual-addressing": "false",
         },
     )
 

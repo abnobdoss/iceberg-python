@@ -16,9 +16,13 @@
 # under the License.
 # pylint:disable=redefined-outer-name
 
+import contextlib
 import math
+import os
 import time
 import uuid
+import warnings
+from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import PosixPath
 from typing import Any
@@ -1272,3 +1276,114 @@ def test_scan_source_field_missing_in_spec(catalog: Catalog, spark: SparkSession
 
     table = catalog.load_table(identifier)
     assert len(list(table.scan().plan_files())) == 3
+
+
+HAS_PYICEBERG_CORE = False
+try:
+    import importlib.util  # noqa: E402
+
+    if importlib.util.find_spec("pyiceberg_core") is not None:
+        import pyiceberg_core.scan  # noqa: F401
+
+        HAS_PYICEBERG_CORE = True
+except (ImportError, NotImplementedError):
+    pass
+
+requires_pyiceberg_core = pytest.mark.skipif(
+    not HAS_PYICEBERG_CORE, reason="pyiceberg-core is not installed or lacks native scan bindings"
+)
+
+
+@contextlib.contextmanager
+def env_var(key: str, value: str) -> Iterator[None]:
+    old_value = os.environ.get(key)
+    os.environ[key] = value
+    try:
+        yield
+    finally:
+        if old_value is None:
+            del os.environ[key]
+        else:
+            os.environ[key] = old_value
+
+
+def assert_no_native_scan_fallback(caught_warnings: list[warnings.WarningMessage]) -> None:
+    fallback_warnings = [
+        warning
+        for warning in caught_warnings
+        if "Falling back to PyArrow scan because pyiceberg-core cannot handle this scan" in str(warning.message)
+    ]
+    assert fallback_warnings == []
+
+
+def assert_same_column_names(left: pa.Table, right: pa.Table) -> None:
+    assert left.schema.names == right.schema.names
+
+
+def assert_same_rows(left: pa.Table, right: pa.Table) -> None:
+    assert sorted(left.to_pylist(), key=repr) == sorted(right.to_pylist(), key=repr)
+
+
+def assert_native_scan_eligible(scan: Any) -> None:
+    from pyiceberg.io.pyiceberg_core import can_read_projected_schema_with_pyiceberg_core
+
+    assert can_read_projected_schema_with_pyiceberg_core(
+        scan.table_metadata.schema(),
+        scan.projection(),
+        scan.row_filter,
+        scan.case_sensitive,
+    )
+
+
+def assert_scan_has_delete_files(scan: Any) -> None:
+    assert any(task.delete_files for task in scan.plan_files())
+
+
+@pytest.mark.integration
+@requires_pyiceberg_core
+@pytest.mark.parametrize("catalog", [lf("session_catalog_hive"), lf("session_catalog")])
+def test_native_arrow_scan_comparisons(catalog: Catalog) -> None:
+    # 1. Unpartitioned table
+    table_limit = catalog.load_table("default.test_limit")
+
+    # 2. Partitioned table
+    table_partitioned = catalog.load_table("default.test_partitioned_by_hours")
+
+    # 3. Table with positional deletes
+    table_deletes = catalog.load_table("default.test_positional_mor_deletes_v2")
+
+    scans = [
+        # Unpartitioned table scans
+        (table_limit.scan(), False),
+        (table_limit.scan(selected_fields=("idx",)), False),
+        (table_limit.scan(row_filter="idx > 5", selected_fields=("idx",)), False),
+        (table_limit.scan(limit=3), False),
+        (table_limit.scan(limit=0), False),
+        (table_limit.scan(limit=999), False),
+        # Partitioned table scans
+        (table_partitioned.scan(), False),
+        (table_partitioned.scan(selected_fields=("ts",)), False),
+    ]
+    scans.extend(
+        [
+            (table_deletes.scan(), True),
+            (table_deletes.scan(row_filter="letter >= 'e'", limit=2), True),
+        ]
+    )
+
+    for scan, expect_delete_files in scans:
+        assert_native_scan_eligible(scan)
+        if expect_delete_files:
+            assert_scan_has_delete_files(scan)
+
+        with env_var("PYICEBERG_RUST_ARROW_SCAN", "0"):
+            pyarrow_reader_table = scan.to_arrow_batch_reader().read_all()
+
+        with env_var("PYICEBERG_RUST_ARROW_SCAN", "1"):
+            with warnings.catch_warnings(record=True) as caught_warnings:
+                warnings.simplefilter("always")
+                native_reader_table = scan.to_arrow_batch_reader().read_all()
+
+        assert_no_native_scan_fallback(caught_warnings)
+        assert_same_column_names(pyarrow_reader_table, native_reader_table)
+        assert_same_rows(pyarrow_reader_table, native_reader_table)
