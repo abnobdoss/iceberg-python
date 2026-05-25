@@ -110,6 +110,7 @@ if TYPE_CHECKING:
 
 ALWAYS_TRUE = AlwaysTrue()
 DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE = "downcast-ns-timestamp-to-us-on-write"
+PYICEBERG_RUST_ARROW_SCAN = "PYICEBERG_RUST_ARROW_SCAN"
 
 
 @dataclass()
@@ -2242,9 +2243,36 @@ class DataScan(TableScan):
 
         from pyiceberg.io.pyarrow import ArrowScan, schema_to_pyarrow
 
-        target_schema = schema_to_pyarrow(self.projection())
+        projected_schema = self.projection()
+        if self.limit is None and os.environ.get(PYICEBERG_RUST_ARROW_SCAN, "").lower() in {"1", "true", "yes"}:
+            from pyiceberg.io.pyiceberg_core import (
+                arrow_batch_reader_from_pyiceberg_core,
+                can_read_projected_schema_with_pyiceberg_core,
+            )
+
+            if can_read_projected_schema_with_pyiceberg_core(
+                self.table_metadata.schema(), projected_schema, self.row_filter, self.case_sensitive
+            ):
+                try:
+                    return arrow_batch_reader_from_pyiceberg_core(
+                        self.io,
+                        self.plan_files(),
+                        self.table_metadata.schema(),
+                        projected_schema,
+                        self.table_metadata.specs(),
+                        self.table_metadata.name_mapping(),
+                        self.case_sensitive,
+                    )
+                except (ModuleNotFoundError, NotImplementedError, ValueError) as exc:
+                    warnings.warn(
+                        f"Falling back to PyArrow scan because pyiceberg-core cannot handle this scan: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+
+        target_schema = schema_to_pyarrow(projected_schema)
         batches = ArrowScan(
-            self.table_metadata, self.io, self.projection(), self.row_filter, self.case_sensitive, self.limit
+            self.table_metadata, self.io, projected_schema, self.row_filter, self.case_sensitive, self.limit
         ).to_record_batches(self.plan_files())
 
         return pa.RecordBatchReader.from_batches(

@@ -26,6 +26,7 @@ import pytest
 from pyiceberg.expressions import And, EqualTo, IsNull, StartsWith
 from pyiceberg.io import FileIO, InputFile, OutputFile
 from pyiceberg.io.pyiceberg_core import (
+    can_read_projected_schema_with_pyiceberg_core,
     delete_file_to_pyiceberg_core,
     expression_to_pyiceberg_core,
     file_io_to_pyiceberg_core,
@@ -293,6 +294,13 @@ def test_file_scan_task_to_pyiceberg_core_adds_filter_only_field_to_read_project
     converted = file_scan_task_to_pyiceberg_core(task, simple_schema, projected_schema=projected_schema)
 
     assert converted.kwargs["project_field_ids"] == [1, 2]
+
+
+def test_can_read_projected_schema_with_pyiceberg_core_requires_filter_fields(simple_schema: Schema) -> None:
+    projected_schema = Schema(NestedField(1, "id", IntegerType(), required=True), schema_id=3)
+
+    assert not can_read_projected_schema_with_pyiceberg_core(simple_schema, projected_schema, EqualTo("data", "abc"), True)
+    assert can_read_projected_schema_with_pyiceberg_core(simple_schema, projected_schema, EqualTo("id", 1), True)
 
 
 def test_file_scan_task_to_pyiceberg_core_requires_partition_spec_for_partitioned_task(simple_schema: Schema) -> None:
