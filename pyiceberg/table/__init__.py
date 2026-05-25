@@ -113,6 +113,14 @@ DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE = "downcast-ns-timestamp-to-us-on-write"
 PYICEBERG_RUST_ARROW_SCAN = "PYICEBERG_RUST_ARROW_SCAN"
 
 
+def _use_rust_arrow_scan() -> bool:
+    return os.environ.get(PYICEBERG_RUST_ARROW_SCAN, "").lower() in {"1", "true", "yes"}
+
+
+def _has_equality_delete_files(tasks: Iterable[FileScanTask]) -> bool:
+    return any(delete_file.content == DataFileContent.EQUALITY_DELETES for task in tasks for delete_file in task.delete_files)
+
+
 @dataclass()
 class UpsertResult:
     """Summary the upsert operation."""
@@ -1943,17 +1951,15 @@ class FileScanTask(ScanTask):
             A FileScanTask with the converted data and delete files.
 
         Raises:
-            NotImplementedError: If equality delete files are encountered.
+            NotImplementedError: If equality delete files are encountered without native scan enabled.
         """
-        from pyiceberg.catalog.rest.scan_planning import RESTEqualityDeleteFile
-
         data_file = _rest_file_to_data_file(rest_task.data_file)
 
         resolved_deletes: set[DataFile] = set()
         if rest_task.delete_file_references:
             for idx in rest_task.delete_file_references:
                 delete_file = delete_files[idx]
-                if isinstance(delete_file, RESTEqualityDeleteFile):
+                if delete_file.content == "equality-deletes" and not _use_rust_arrow_scan():
                     raise NotImplementedError(f"PyIceberg does not yet support equality deletes: {delete_file.file_path}")
                 resolved_deletes.add(_rest_file_to_data_file(delete_file))
 
@@ -1992,6 +1998,7 @@ def _rest_file_to_data_file(rest_file: RESTContentFile) -> DataFile:
         nan_value_counts=nan_value_counts,
         split_offsets=rest_file.split_offsets,
         sort_order_id=rest_file.sort_order_id,
+        equality_ids=getattr(rest_file, "equality_ids", None),
     )
     data_file.spec_id = rest_file.spec_id
     return data_file
@@ -2182,7 +2189,11 @@ class DataScan(TableScan):
             elif data_file.content == DataFileContent.POSITION_DELETES:
                 delete_index.add_delete_file(manifest_entry, partition_key=data_file.partition)
             elif data_file.content == DataFileContent.EQUALITY_DELETES:
-                raise ValueError("PyIceberg does not yet support equality deletes: https://github.com/apache/iceberg/issues/6568")
+                if not _use_rust_arrow_scan():
+                    raise ValueError(
+                        "PyIceberg does not yet support equality deletes: https://github.com/apache/iceberg/issues/6568"
+                    )
+                delete_index.add_delete_file(manifest_entry, partition_key=data_file.partition)
             else:
                 raise ValueError(f"Unknown DataFileContent ({data_file.content}): {manifest_entry}")
         return [
@@ -2244,19 +2255,21 @@ class DataScan(TableScan):
         from pyiceberg.io.pyarrow import ArrowScan, schema_to_pyarrow
 
         projected_schema = self.projection()
-        if os.environ.get(PYICEBERG_RUST_ARROW_SCAN, "").lower() in {"1", "true", "yes"}:
+        if _use_rust_arrow_scan():
             from pyiceberg.io.pyiceberg_core import (
                 arrow_batch_reader_from_pyiceberg_core,
                 can_read_projected_schema_with_pyiceberg_core,
             )
 
-            if can_read_projected_schema_with_pyiceberg_core(
+            can_read_natively = can_read_projected_schema_with_pyiceberg_core(
                 self.table_metadata.schema(), projected_schema, self.row_filter, self.case_sensitive
-            ):
+            )
+            native_tasks = list(self.plan_files())
+            if can_read_natively:
                 try:
                     return arrow_batch_reader_from_pyiceberg_core(
                         self.io,
-                        self.plan_files(),
+                        native_tasks,
                         self.table_metadata.schema(),
                         projected_schema,
                         self.table_metadata.specs(),
@@ -2265,11 +2278,15 @@ class DataScan(TableScan):
                         limit=self.limit,
                     )
                 except (ModuleNotFoundError, NotImplementedError, ValueError) as exc:
+                    if _has_equality_delete_files(native_tasks):
+                        raise
                     warnings.warn(
                         f"Falling back to PyArrow scan because pyiceberg-core cannot handle this scan: {exc}",
                         RuntimeWarning,
                         stacklevel=2,
                     )
+            elif _has_equality_delete_files(native_tasks):
+                raise NotImplementedError("PyIceberg cannot apply equality deletes without the native scan path")
 
         target_schema = schema_to_pyarrow(projected_schema)
         batches = ArrowScan(

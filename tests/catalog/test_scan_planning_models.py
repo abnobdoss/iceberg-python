@@ -568,3 +568,35 @@ def test_plan_scan_equality_deletes_not_supported(rest_scan_catalog: RestCatalog
     request = PlanTableScanRequest()
     with pytest.raises(NotImplementedError, match="PyIceberg does not yet support equality deletes"):
         list(rest_scan_catalog.plan_scan(("db", "tbl"), request))
+
+
+def test_plan_scan_equality_deletes_preserved_for_native_scan(
+    rest_scan_catalog: RestCatalog, requests_mock: Mocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PYICEBERG_RUST_ARROW_SCAN", "1")
+    file_one = _rest_data_file(file_path="s3://bucket/tbl/data/file1.parquet")
+    equality_delete = _rest_equality_delete_file(equality_ids=[1, 2])
+    requests_mock.post(
+        f"{TEST_URI}v1/namespaces/db/tables/tbl/plan",
+        json={
+            "status": "completed",
+            "plan-id": "plan-123",
+            "delete-files": [equality_delete],
+            "file-scan-tasks": [
+                {
+                    "data-file": file_one,
+                    "delete-file-references": [0],
+                }
+            ],
+            "plan-tasks": [],
+        },
+        status_code=200,
+    )
+
+    request = PlanTableScanRequest()
+    tasks = list(rest_scan_catalog.plan_scan(("db", "tbl"), request))
+
+    assert len(tasks) == 1
+    delete_file = next(iter(tasks[0].delete_files))
+    assert int(delete_file.content) == 2
+    assert delete_file.equality_ids == [1, 2]

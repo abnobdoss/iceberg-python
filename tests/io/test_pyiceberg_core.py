@@ -26,6 +26,7 @@ import pytest
 from pyiceberg.expressions import And, EqualTo, IsNull, StartsWith
 from pyiceberg.io import FileIO, InputFile, OutputFile
 from pyiceberg.io.pyiceberg_core import (
+    DEFAULT_NATIVE_ARROW_BATCH_SIZE,
     arrow_batch_reader_from_pyiceberg_core,
     can_read_projected_schema_with_pyiceberg_core,
     delete_file_to_pyiceberg_core,
@@ -96,6 +97,12 @@ class CoreReference(CoreObject):
 
 
 class CoreReader(CoreObject):
+    last_init: CoreReader | None = None
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        CoreReader.last_init = self
+
     def read(self, *args: Any, **kwargs: Any) -> Any:
         return CoreObject(*args, **kwargs)
 
@@ -166,6 +173,23 @@ def test_file_io_to_pyiceberg_core_uses_file_io_properties() -> None:
     assert converted.kwargs == {"properties": {"s3.region": "us-east-1"}}
 
 
+def test_file_io_to_pyiceberg_core_filters_non_string_properties() -> None:
+    converted = file_io_to_pyiceberg_core(FakeFileIO(properties={"s3.region": "us-east-1", "auth.manager": object()}))
+
+    assert converted.kwargs == {"properties": {"s3.region": "us-east-1"}}
+
+
+def test_file_io_to_pyiceberg_core_maps_path_style_s3_property() -> None:
+    converted = file_io_to_pyiceberg_core(FakeFileIO(properties={"s3.force-virtual-addressing": "false"}))
+
+    assert converted.kwargs == {
+        "properties": {
+            "s3.force-virtual-addressing": "false",
+            "s3.path-style-access": "true",
+        }
+    }
+
+
 def test_expression_to_pyiceberg_core_converts_expression_tree(simple_schema: Schema) -> None:
     converted = expression_to_pyiceberg_core(And(EqualTo("id", 34), StartsWith("data", "abc")), simple_schema)
 
@@ -216,7 +240,7 @@ def test_delete_file_to_pyiceberg_core_converts_delete_file_payload() -> None:
     assert converted.kwargs == {"partition_spec_id": 7, "equality_ids": None}
 
 
-def test_delete_file_to_pyiceberg_core_rejects_equality_deletes_until_parity_lands() -> None:
+def test_delete_file_to_pyiceberg_core_converts_equality_deletes() -> None:
     delete_file = DataFile.from_args(
         content=DataFileContent.EQUALITY_DELETES,
         file_path="s3://warehouse/table/eq-delete.parquet",
@@ -234,7 +258,30 @@ def test_delete_file_to_pyiceberg_core_rejects_equality_deletes_until_parity_lan
     )
     delete_file.spec_id = 7
 
-    with pytest.raises(NotImplementedError, match="equality delete scan parity"):
+    converted = delete_file_to_pyiceberg_core(delete_file)
+    assert converted.args == ("s3://warehouse/table/eq-delete.parquet", 123, "equality-deletes")
+    assert converted.kwargs == {"partition_spec_id": 7, "equality_ids": [1]}
+
+
+def test_delete_file_to_pyiceberg_core_raises_value_error_for_equality_delete_without_ids() -> None:
+    delete_file = DataFile.from_args(
+        content=DataFileContent.EQUALITY_DELETES,
+        file_path="s3://warehouse/table/eq-delete.parquet",
+        file_format="PARQUET",
+        partition=Record(),
+        record_count=1,
+        file_size_in_bytes=123,
+        column_sizes={},
+        value_counts={},
+        null_value_counts={},
+        nan_value_counts={},
+        lower_bounds={},
+        upper_bounds={},
+        equality_ids=None,
+    )
+    delete_file.spec_id = 7
+
+    with pytest.raises(ValueError, match="equality_ids is required for equality delete file"):
         delete_file_to_pyiceberg_core(delete_file)
 
 
@@ -362,6 +409,8 @@ def test_arrow_batch_reader_from_pyiceberg_core_with_partition_and_name_mapping(
     )
 
     assert isinstance(reader, CoreObject)
+    assert CoreReader.last_init is not None
+    assert CoreReader.last_init.kwargs["batch_size"] == DEFAULT_NATIVE_ARROW_BATCH_SIZE
     assert len(reader.args) == 2
     assert isinstance(reader.args[0], CoreSchema)
     assert isinstance(reader.args[1], list)
@@ -402,3 +451,6 @@ def test_arrow_batch_reader_from_pyiceberg_core_with_limit(simple_schema: Schema
 
     assert isinstance(reader, CoreObject)
     assert reader.kwargs.get("max_rows") == 5
+    assert CoreReader.last_init is not None
+    assert CoreReader.last_init.kwargs["batch_size"] == DEFAULT_NATIVE_ARROW_BATCH_SIZE
+    assert CoreReader.last_init.kwargs["data_file_concurrency_limit"] == 1

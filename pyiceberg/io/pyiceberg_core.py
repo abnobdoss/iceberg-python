@@ -61,6 +61,9 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
 
+DEFAULT_NATIVE_ARROW_BATCH_SIZE = 65_536
+
+
 def _core_module(name: str) -> Any:
     """Import a pyiceberg-core submodule lazily so PyIceberg can run without the Rust wheel."""
     try:
@@ -87,7 +90,10 @@ def schema_to_pyiceberg_core(schema: Schema) -> Any:
 
 def file_io_to_pyiceberg_core(file_io: FileIO) -> Any:
     """Convert a PyIceberg FileIO to a pyiceberg-core FileIO-like object."""
-    return _core_module("file_io").FileIO.from_props(dict(file_io.properties))
+    props = {key: value for key, value in file_io.properties.items() if isinstance(value, str)}
+    if (force_virtual_addressing := props.get("s3.force-virtual-addressing")) is not None:
+        props["s3.path-style-access"] = str(force_virtual_addressing.lower() == "false").lower()
+    return _core_module("file_io").FileIO.from_props(props)
 
 
 def _literal_value(value: Any) -> Any:
@@ -255,7 +261,9 @@ def delete_file_to_pyiceberg_core(delete_file: DataFile) -> Any:
     if content == 1:
         file_type = "position-deletes"
     elif content == 2:
-        raise NotImplementedError("pyiceberg-core equality delete scan parity is tracked separately")
+        if not delete_file.equality_ids:
+            raise ValueError(f"equality_ids is required for equality delete file: {delete_file.file_path}")
+        file_type = "equality-deletes"
     else:
         raise ValueError(f"Expected a delete file, got data file content {delete_file.content!r}")
 
@@ -327,5 +335,9 @@ def arrow_batch_reader_from_pyiceberg_core(
         for task in tasks
     ]
 
-    reader = _core_module("scan").ArrowReader(file_io_to_pyiceberg_core(file_io))
+    reader_kwargs: dict[str, Any] = {"batch_size": DEFAULT_NATIVE_ARROW_BATCH_SIZE}
+    if limit is not None:
+        reader_kwargs["data_file_concurrency_limit"] = 1
+
+    reader = _core_module("scan").ArrowReader(file_io_to_pyiceberg_core(file_io), **reader_kwargs)
     return reader.read(schema_to_pyiceberg_core(projected_schema), core_tasks, max_rows=limit)
