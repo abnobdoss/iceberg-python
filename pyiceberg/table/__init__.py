@@ -111,10 +111,15 @@ if TYPE_CHECKING:
 ALWAYS_TRUE = AlwaysTrue()
 DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE = "downcast-ns-timestamp-to-us-on-write"
 PYICEBERG_RUST_ARROW_SCAN = "PYICEBERG_RUST_ARROW_SCAN"
+PYICEBERG_RUST_PLANNED_ARROW_SCAN = "PYICEBERG_RUST_PLANNED_ARROW_SCAN"
 
 
 def _use_rust_arrow_scan() -> bool:
     return os.environ.get(PYICEBERG_RUST_ARROW_SCAN, "").lower() in {"1", "true", "yes"}
+
+
+def _use_rust_planned_arrow_scan() -> bool:
+    return os.environ.get(PYICEBERG_RUST_PLANNED_ARROW_SCAN, "").lower() in {"1", "true", "yes"}
 
 
 def _has_equality_delete_files(tasks: Iterable[FileScanTask]) -> bool:
@@ -2255,7 +2260,33 @@ class DataScan(TableScan):
         from pyiceberg.io.pyarrow import ArrowScan, schema_to_pyarrow
 
         projected_schema = self.projection()
-        if _use_rust_arrow_scan():
+        use_planned = _use_rust_planned_arrow_scan()
+        use_task = _use_rust_arrow_scan()
+
+        if use_planned:
+            from pyiceberg.io.pyiceberg_core import arrow_batch_reader_from_pyiceberg_core_planned
+
+            try:
+                return arrow_batch_reader_from_pyiceberg_core_planned(
+                    self.io,
+                    self.table_metadata,
+                    projected_schema,
+                    self.row_filter,
+                    self.selected_fields,
+                    self.table_identifier,
+                    self.snapshot_id,
+                    self.case_sensitive,
+                    limit=self.limit,
+                )
+            except (ModuleNotFoundError, NotImplementedError, ValueError) as exc:
+                warnings.warn(
+                    f"Falling back to native task-based scan because Rust-planned scan failed: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                use_task = True
+
+        if use_task:
             from pyiceberg.io.pyiceberg_core import (
                 arrow_batch_reader_from_pyiceberg_core,
                 can_read_projected_schema_with_pyiceberg_core,

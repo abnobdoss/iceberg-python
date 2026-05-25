@@ -60,6 +60,8 @@ from pyiceberg.typedef import Record
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
+    from pyiceberg.table.metadata import TableMetadata
+
 
 DEFAULT_NATIVE_ARROW_BATCH_SIZE = 65_536
 
@@ -341,3 +343,47 @@ def arrow_batch_reader_from_pyiceberg_core(
 
     reader = _core_module("scan").ArrowReader(file_io_to_pyiceberg_core(file_io), **reader_kwargs)
     return reader.read(schema_to_pyiceberg_core(projected_schema), core_tasks, max_rows=limit)
+
+
+def arrow_batch_reader_from_pyiceberg_core_planned(
+    file_io: FileIO,
+    table_metadata: TableMetadata,
+    projected_schema: Schema,
+    row_filter: BooleanExpression,
+    selected_fields: tuple[str, ...] | None,
+    table_identifier: tuple[str, ...] | None,
+    snapshot_id: int | None,
+    case_sensitive: bool = True,
+    limit: int | None = None,
+) -> Any:
+    """Read Arrow record batches using iceberg-rust planned scan."""
+    core_scan = _core_module("scan")
+    core_schema = schema_to_pyiceberg_core(projected_schema)
+    core_io = file_io_to_pyiceberg_core(file_io)
+
+    identifier = list(table_identifier) if table_identifier else ["pyiceberg", "anonymous"]
+    metadata_json = _model_json(table_metadata)
+
+    table = core_scan.Table.from_metadata_json(
+        core_io,
+        identifier,
+        metadata_json,
+    )
+
+    if selected_fields == ("*",):
+        fields = None
+    elif selected_fields is not None:
+        fields = list(selected_fields)
+    else:
+        fields = None
+
+    core_predicate = expression_to_pyiceberg_core(row_filter, table_metadata.schema(), case_sensitive)
+
+    return table.read_arrow(
+        core_schema,
+        selected_fields=fields,
+        predicate=core_predicate,
+        snapshot_id=snapshot_id,
+        case_sensitive=case_sensitive,
+        max_rows=limit,
+    )

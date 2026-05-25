@@ -28,6 +28,7 @@ from pyiceberg.io import FileIO, InputFile, OutputFile
 from pyiceberg.io.pyiceberg_core import (
     DEFAULT_NATIVE_ARROW_BATCH_SIZE,
     arrow_batch_reader_from_pyiceberg_core,
+    arrow_batch_reader_from_pyiceberg_core_planned,
     can_read_projected_schema_with_pyiceberg_core,
     delete_file_to_pyiceberg_core,
     expression_to_pyiceberg_core,
@@ -107,6 +108,21 @@ class CoreReader(CoreObject):
         return CoreObject(*args, **kwargs)
 
 
+class CoreTable(CoreObject):
+    last_init: CoreTable | None = None
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        CoreTable.last_init = self
+
+    @classmethod
+    def from_metadata_json(cls, file_io: Any, identifier: list[str], metadata_json: str, *args: Any, **kwargs: Any) -> CoreTable:
+        return cls(*args, file_io=file_io, identifier=identifier, metadata_json=metadata_json, **kwargs)
+
+    def read_arrow(self, *args: Any, **kwargs: Any) -> Any:
+        return CoreObject(*args, **kwargs)
+
+
 class FakeFileIO(FileIO):
     def new_input(self, location: str) -> InputFile:
         raise NotImplementedError
@@ -136,6 +152,7 @@ def fake_pyiceberg_core(monkeypatch: pytest.MonkeyPatch) -> None:
     scan.DeleteFile = CoreObject
     scan.FileScanTask = CoreObject
     scan.ArrowReader = CoreReader
+    scan.Table = CoreTable
 
     monkeypatch.setitem(sys.modules, "pyiceberg_core", root)
     monkeypatch.setitem(sys.modules, "pyiceberg_core.schema", schema)
@@ -454,3 +471,92 @@ def test_arrow_batch_reader_from_pyiceberg_core_with_limit(simple_schema: Schema
     assert CoreReader.last_init is not None
     assert CoreReader.last_init.kwargs["batch_size"] == DEFAULT_NATIVE_ARROW_BATCH_SIZE
     assert CoreReader.last_init.kwargs["data_file_concurrency_limit"] == 1
+
+
+def test_arrow_batch_reader_from_pyiceberg_core_planned(simple_schema: Schema) -> None:
+    from pyiceberg.expressions import EqualTo
+    from pyiceberg.table.metadata import TableMetadataV2
+
+    metadata = TableMetadataV2(
+        location="s3://warehouse/table",
+        last_sequence_number=1,
+        last_updated_ms=1600000000000,
+        last_column_id=2,
+        schemas=[simple_schema],
+        current_schema_id=simple_schema.schema_id,
+        partition_specs=[PartitionSpec()],
+        default_spec_id=0,
+        last_partition_id=1000,
+        default_sort_order_id=0,
+        sort_orders=[],
+        properties={},
+        snapshots=[],
+        snapshot_log=[],
+        metadata_log=[],
+    )
+
+    reader = arrow_batch_reader_from_pyiceberg_core_planned(
+        FakeFileIO({}),
+        metadata,
+        simple_schema,
+        EqualTo("id", 123),
+        selected_fields=("id",),
+        table_identifier=("ns", "tbl"),
+        snapshot_id=5,
+        case_sensitive=True,
+        limit=10,
+    )
+
+    assert isinstance(reader, CoreObject)
+    assert CoreTable.last_init is not None
+    assert CoreTable.last_init.kwargs["identifier"] == ["ns", "tbl"]
+    assert CoreTable.last_init.kwargs["metadata_json"] == metadata.model_dump_json(by_alias=True, exclude_none=True)
+    assert isinstance(CoreTable.last_init.kwargs["file_io"], CoreFileIO)
+
+    assert isinstance(reader.args[0], CoreSchema)
+    assert reader.kwargs["selected_fields"] == ["id"]
+    assert reader.kwargs["snapshot_id"] == 5
+    assert reader.kwargs["case_sensitive"] is True
+    assert reader.kwargs["max_rows"] == 10
+
+    pred = reader.kwargs["predicate"]
+    assert isinstance(pred, CorePredicate)
+    assert pred.kwargs["op"] == "eq"
+    assert pred.kwargs["name"] == "id"
+    assert pred.kwargs["args"] == (123,)
+
+
+def test_arrow_batch_reader_from_pyiceberg_core_planned_star_fields(simple_schema: Schema) -> None:
+    from pyiceberg.expressions import AlwaysTrue
+    from pyiceberg.table.metadata import TableMetadataV2
+
+    metadata = TableMetadataV2(
+        location="s3://warehouse/table",
+        last_sequence_number=1,
+        last_updated_ms=1600000000000,
+        last_column_id=2,
+        schemas=[simple_schema],
+        current_schema_id=simple_schema.schema_id,
+        partition_specs=[PartitionSpec()],
+        default_spec_id=0,
+        last_partition_id=1000,
+        default_sort_order_id=0,
+        sort_orders=[],
+        properties={},
+        snapshots=[],
+        snapshot_log=[],
+        metadata_log=[],
+    )
+
+    reader = arrow_batch_reader_from_pyiceberg_core_planned(
+        FakeFileIO({}),
+        metadata,
+        simple_schema,
+        AlwaysTrue(),
+        selected_fields=("*",),
+        table_identifier=None,
+        snapshot_id=None,
+        case_sensitive=True,
+        limit=None,
+    )
+    assert reader.kwargs["selected_fields"] is None
