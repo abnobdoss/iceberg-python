@@ -255,7 +255,9 @@ def delete_file_to_pyiceberg_core(delete_file: DataFile) -> Any:
     if content == 1:
         file_type = "position-deletes"
     elif content == 2:
-        raise NotImplementedError("pyiceberg-core equality delete scan parity is tracked separately")
+        if not delete_file.equality_ids:
+            raise ValueError(f"equality_ids is required for equality delete file: {delete_file.file_path}")
+        file_type = "equality-deletes"
     else:
         raise ValueError(f"Expected a delete file, got data file content {delete_file.content!r}")
 
