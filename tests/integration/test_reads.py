@@ -1279,18 +1279,27 @@ def test_scan_source_field_missing_in_spec(catalog: Catalog, spark: SparkSession
 
 
 HAS_PYICEBERG_CORE = False
+HAS_PYICEBERG_CORE_PLANNED_SCAN = False
 try:
     import importlib.util  # noqa: E402
 
     if importlib.util.find_spec("pyiceberg_core") is not None:
-        import pyiceberg_core.scan  # noqa: F401
+        import pyiceberg_core.scan as pyiceberg_core_scan
 
         HAS_PYICEBERG_CORE = True
+        table_cls = getattr(pyiceberg_core_scan, "Table", None)
+        HAS_PYICEBERG_CORE_PLANNED_SCAN = bool(
+            table_cls is not None and hasattr(table_cls, "from_metadata_json") and hasattr(table_cls, "read_arrow")
+        )
 except (ImportError, NotImplementedError):
     pass
 
 requires_pyiceberg_core = pytest.mark.skipif(
     not HAS_PYICEBERG_CORE, reason="pyiceberg-core is not installed or lacks native scan bindings"
+)
+requires_pyiceberg_core_planned_scan = pytest.mark.skipif(
+    not HAS_PYICEBERG_CORE_PLANNED_SCAN,
+    reason="pyiceberg-core is not installed or lacks planned native scan bindings",
 )
 
 
@@ -1312,6 +1321,7 @@ def assert_no_native_scan_fallback(caught_warnings: list[warnings.WarningMessage
         warning
         for warning in caught_warnings
         if "Falling back to PyArrow scan because pyiceberg-core cannot handle this scan" in str(warning.message)
+        or "Falling back to native task-based scan because Rust-planned scan failed" in str(warning.message)
     ]
     assert fallback_warnings == []
 
@@ -1390,7 +1400,7 @@ def test_native_arrow_scan_comparisons(catalog: Catalog) -> None:
 
 
 @pytest.mark.integration
-@requires_pyiceberg_core
+@requires_pyiceberg_core_planned_scan
 @pytest.mark.parametrize("catalog", [lf("session_catalog_hive"), lf("session_catalog")])
 def test_rust_planned_native_arrow_scan_comparisons(catalog: Catalog) -> None:
     # 1. Unpartitioned table
