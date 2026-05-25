@@ -146,6 +146,16 @@ def _read_field_ids(
     return ids
 
 
+def can_read_projected_schema_with_pyiceberg_core(
+    schema: Schema,
+    projected_schema: Schema,
+    row_filter: BooleanExpression,
+    case_sensitive: bool,
+) -> bool:
+    """Return whether pyiceberg-core can read exactly the requested projection for this filter."""
+    return _expression_field_ids(row_filter, schema, case_sensitive).issubset(projected_schema.field_ids)
+
+
 _UNARY_METHODS: dict[type[BooleanExpression], str] = {
     IsNull: "is_null",
     NotNull: "is_not_null",
@@ -291,3 +301,30 @@ def file_scan_task_to_pyiceberg_core(
         name_mapping=_model_json(name_mapping) if name_mapping is not None else None,
         case_sensitive=case_sensitive,
     )
+
+
+def arrow_batch_reader_from_pyiceberg_core(
+    file_io: FileIO,
+    tasks: Iterable[FileScanTask],
+    schema: Schema,
+    projected_schema: Schema,
+    partition_specs: dict[int, PartitionSpec],
+    name_mapping: NameMapping | None,
+    case_sensitive: bool = True,
+) -> Any:
+    """Read PyIceberg scan tasks through pyiceberg-core's ArrowReader."""
+    core_tasks = [
+        file_scan_task_to_pyiceberg_core(
+            task,
+            schema,
+            projected_schema,
+            partition_spec=partition_specs.get(task.file.spec_id),
+            name_mapping=name_mapping,
+            case_sensitive=case_sensitive,
+            project_field_ids=list(projected_schema.field_ids),
+        )
+        for task in tasks
+    ]
+
+    reader = _core_module("scan").ArrowReader(file_io_to_pyiceberg_core(file_io))
+    return reader.read(schema_to_pyiceberg_core(projected_schema), core_tasks)
