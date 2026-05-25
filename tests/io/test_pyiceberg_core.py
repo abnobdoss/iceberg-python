@@ -526,6 +526,45 @@ def test_arrow_batch_reader_from_pyiceberg_core_planned(simple_schema: Schema) -
     assert pred.kwargs["args"] == (123,)
 
 
+def test_arrow_batch_reader_from_pyiceberg_core_planned_requires_table_api(
+    monkeypatch: pytest.MonkeyPatch, simple_schema: Schema
+) -> None:
+    import pyiceberg_core.scan as core_scan
+
+    from pyiceberg.expressions import AlwaysTrue
+    from pyiceberg.table.metadata import TableMetadataV2
+
+    metadata = TableMetadataV2(
+        location="s3://warehouse/table",
+        last_sequence_number=1,
+        last_updated_ms=1600000000000,
+        last_column_id=2,
+        schemas=[simple_schema],
+        current_schema_id=simple_schema.schema_id,
+        partition_specs=[PartitionSpec()],
+        default_spec_id=0,
+        last_partition_id=1000,
+        default_sort_order_id=0,
+        sort_orders=[],
+        properties={},
+        snapshots=[],
+        snapshot_log=[],
+        metadata_log=[],
+    )
+
+    monkeypatch.delattr(core_scan, "Table")
+    with pytest.raises(NotImplementedError, match="scan.Table.from_metadata_json"):
+        arrow_batch_reader_from_pyiceberg_core_planned(
+            FakeFileIO({}),
+            metadata,
+            simple_schema,
+            AlwaysTrue(),
+            selected_fields=None,
+            table_identifier=None,
+            snapshot_id=None,
+        )
+
+
 def test_arrow_batch_reader_from_pyiceberg_core_planned_star_fields(simple_schema: Schema) -> None:
     from pyiceberg.expressions import AlwaysTrue
     from pyiceberg.table.metadata import TableMetadataV2

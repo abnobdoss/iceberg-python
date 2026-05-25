@@ -2278,7 +2278,7 @@ class DataScan(TableScan):
                     self.case_sensitive,
                     limit=self.limit,
                 )
-            except (ModuleNotFoundError, NotImplementedError, ValueError) as exc:
+            except (ModuleNotFoundError, NotImplementedError, AttributeError, ValueError) as exc:
                 warnings.warn(
                     f"Falling back to native task-based scan because Rust-planned scan failed: {exc}",
                     RuntimeWarning,

@@ -358,17 +358,23 @@ def arrow_batch_reader_from_pyiceberg_core_planned(
 ) -> Any:
     """Read Arrow record batches using iceberg-rust planned scan."""
     core_scan = _core_module("scan")
+    table_cls = getattr(core_scan, "Table", None)
+    if table_cls is None or not hasattr(table_cls, "from_metadata_json"):
+        raise NotImplementedError("The installed pyiceberg-core wheel does not expose scan.Table.from_metadata_json")
+
     core_schema = schema_to_pyiceberg_core(projected_schema)
     core_io = file_io_to_pyiceberg_core(file_io)
 
     identifier = list(table_identifier) if table_identifier else ["pyiceberg", "anonymous"]
     metadata_json = _model_json(table_metadata)
 
-    table = core_scan.Table.from_metadata_json(
+    table = table_cls.from_metadata_json(
         core_io,
         identifier,
         metadata_json,
     )
+    if not hasattr(table, "read_arrow"):
+        raise NotImplementedError("The installed pyiceberg-core wheel does not expose scan.Table.read_arrow")
 
     if selected_fields == ("*",):
         fields = None
