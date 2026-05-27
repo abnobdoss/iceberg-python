@@ -17,6 +17,8 @@
 import subprocess
 import sys
 import textwrap
+from datetime import date, datetime, time, timezone
+from decimal import Decimal
 from pathlib import PosixPath
 
 import pyarrow as pa
@@ -336,7 +338,12 @@ def test_key_cols_misaligned(catalog: Catalog) -> None:
 
     df_src = ctx.sql("select 1 as item_id, date '2021-05-01' as order_date, 'B' as order_type").to_arrow_table()
 
-    with pytest.raises(Exception, match=r"""Field ".*" does not exist in schema"""):
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Partial schema updates are not yet supported. The source dataframe is missing the following table columns: order_id"
+        ),
+    ):
         table.upsert(df=df_src, join_cols=["order_id"])
 
 
@@ -581,6 +588,35 @@ def test_upsert_large_composite_key_initial_scan_does_not_recurse(tmp_path: Posi
             join_cols=["order_id", "order_line_id"],
             when_not_matched_insert_all=False,
         )
+        """
+    )
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=False)
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+
+def test_create_match_filter_large_composite_key_binds_without_recursing() -> None:
+    script = textwrap.dedent(
+        """
+        import pyarrow as pa
+
+        from pyiceberg.expressions.visitors import bind
+        from pyiceberg.io.pyarrow import expression_to_pyarrow
+        from pyiceberg.schema import Schema
+        from pyiceberg.table.upsert_util import create_match_filter
+        from pyiceberg.types import LongType, NestedField
+
+        n = 30_000
+        table = pa.table({
+            "order_id": pa.array(range(n), type=pa.int64()),
+            "order_line_id": pa.array(range(100_000, 100_000 + n), type=pa.int64()),
+        })
+        expr = create_match_filter(table, ["order_id", "order_line_id"])
+        schema = Schema(
+            NestedField(1, "order_id", LongType(), required=False),
+            NestedField(2, "order_line_id", LongType(), required=False),
+        )
+        expression_to_pyarrow(bind(schema, expr, case_sensitive=True))
         """
     )
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=False)
@@ -1033,3 +1069,320 @@ def test_upsert_snapshot_properties(catalog: Catalog) -> None:
     for snapshot in snapshots[initial_snapshot_count:]:
         assert snapshot.summary is not None
         assert snapshot.summary.additional_properties.get("test_prop") == "test_value"
+
+
+# Every Iceberg primitive type as a join-key candidate. `val_a` is chosen to coincide with the
+# null-sentinel returned by `_default_scalar` for the type (0 / "" / False / zero-bytes), so any
+# test that puts both `val_a` and a null row in the target also implicitly proves real-vs-null
+# disambiguation. `val_b` is a clearly distinct value of the same type for insert coverage.
+JOIN_KEY_TYPES: list[tuple[str, pa.DataType, object, object]] = [
+    ("bool", pa.bool_(), False, True),
+    ("int32", pa.int32(), 0, 1),
+    ("int64", pa.int64(), 0, 1),
+    ("decimal", pa.decimal128(10, 2), Decimal("0.00"), Decimal("1.50")),
+    ("decimal_0", pa.decimal128(10, 0), Decimal("0"), Decimal("10")),
+    ("date", pa.date32(), date(1970, 1, 1), date(2024, 1, 2)),
+    ("time", pa.time64("us"), time(0, 0), time(12, 0)),
+    ("timestamp", pa.timestamp("us"), datetime(1970, 1, 1), datetime(2024, 1, 1)),
+    ("ts_utc", pa.timestamp("us", "UTC"), datetime(1970, 1, 1, tzinfo=timezone.utc), datetime(2024, 1, 1, tzinfo=timezone.utc)),
+    ("string", pa.string(), "", "b"),
+    ("large_string", pa.large_string(), "", "b"),
+    # UUID as a join key (pa.uuid() extension type) is currently unsupported by the upsert
+    # path: pc.min_max and group_by reject pyarrow extension types. The raw fixed[16] storage
+    # type is covered by the entry below.
+    ("fixed16", pa.binary(16), b"\x00" * 16, b"\x01" * 16),
+    ("fixed4", pa.binary(4), b"\x00" * 4, b"abcd"),
+    ("binary", pa.binary(), b"", b"hello"),
+    ("large_binary", pa.large_binary(), b"", b"hello"),
+]
+
+
+@pytest.mark.parametrize(
+    "type_id, arrow_type, val_a, val_b",
+    JOIN_KEY_TYPES,
+    ids=[t[0] for t in JOIN_KEY_TYPES],
+)
+def test_upsert_basic_matrix(catalog: Catalog, type_id: str, arrow_type: pa.DataType, val_a: object, val_b: object) -> None:
+    """End-to-end update + insert for every Iceberg primitive join-key type."""
+    identifier = "default.test_upsert_basic_matrix"
+    _drop_table(catalog, identifier)
+    schema = pa.schema([("k", arrow_type), ("payload", pa.string())])
+    table = catalog.create_table(identifier, schema)
+    table.append(pa.Table.from_pylist([{"k": val_a, "payload": "old"}], schema=schema))
+
+    res = table.upsert(
+        pa.Table.from_pylist(
+            [{"k": val_a, "payload": "new"}, {"k": val_b, "payload": "ins"}],
+            schema=schema,
+        ),
+        join_cols=["k"],
+    )
+    assert (res.rows_updated, res.rows_inserted) == (1, 1)
+
+    final = {r["k"]: r["payload"] for r in table.scan().to_arrow().to_pylist()}
+    assert final == {val_a: "new", val_b: "ins"}
+
+
+@pytest.mark.parametrize(
+    "type_id, arrow_type, val_a, val_b",
+    JOIN_KEY_TYPES,
+    ids=[t[0] for t in JOIN_KEY_TYPES],
+)
+def test_upsert_null_safe_matrix(catalog: Catalog, type_id: str, arrow_type: pa.DataType, val_a: object, val_b: object) -> None:
+    """End-to-end null-safe equality (<=>) across every primitive join-key type.
+
+    `val_a` is also the type's null-sentinel value (e.g. 0, "", False, zero-bytes), so this
+    test simultaneously asserts that a real `val_a` row and a sentinel-substituted null row do
+    not collide on the join.
+    """
+    identifier = "default.test_upsert_null_safe_matrix"
+    _drop_table(catalog, identifier)
+    schema = pa.schema([("k", arrow_type), ("payload", pa.string())])
+    table = catalog.create_table(identifier, schema)
+    table.append(
+        pa.Table.from_pylist(
+            [{"k": val_a, "payload": "old"}, {"k": None, "payload": "old-null"}],
+            schema=schema,
+        )
+    )
+
+    res = table.upsert(
+        pa.Table.from_pylist(
+            [
+                {"k": val_a, "payload": "new"},  # matches real val_a → UPDATE
+                {"k": None, "payload": "new-null"},  # matches null via <=> → UPDATE
+                {"k": val_b, "payload": "ins"},  # no match → INSERT
+            ],
+            schema=schema,
+        ),
+        join_cols=["k"],
+    )
+    assert (res.rows_updated, res.rows_inserted) == (2, 1)
+
+    final = {r["k"]: r["payload"] for r in table.scan().to_arrow().to_pylist()}
+    assert final == {val_a: "new", None: "new-null", val_b: "ins"}
+
+
+@pytest.mark.parametrize(
+    "target_rows, source_rows, join_cols, expected_updated, expected_inserted, expected_final",
+    [
+        # Multi-col, partial null on both sides: matches under <=>, UPDATE.
+        (
+            [{"a": 0, "b": None, "c": "old"}],
+            [{"a": 0, "b": None, "c": "new"}],
+            ["a", "b"],
+            1,
+            0,
+            [{"a": 0, "b": None, "c": "new"}],
+        ),
+        # Multi-col, all null on both sides: matches under <=>, UPDATE.
+        (
+            [{"a": None, "b": None, "c": "old"}],
+            [{"a": None, "b": None, "c": "new"}],
+            ["a", "b"],
+            1,
+            0,
+            [{"a": None, "b": None, "c": "new"}],
+        ),
+        # Null-keyed source row alongside a non-null match: non-null UPDATEs target, null-keyed
+        # source row finds no <=>-match in target so it INSERTs. Catches the silent-drop bug.
+        (
+            [{"a": 0, "b": 1, "c": "old"}],
+            [{"a": 0, "b": 1, "c": "new"}, {"a": 0, "b": None, "c": "n"}],
+            ["a", "b"],
+            1,
+            1,
+            [{"a": 0, "b": 1, "c": "new"}, {"a": 0, "b": None, "c": "n"}],
+        ),
+        # Null-keyed source row, target has no <=>-matching row: INSERT.
+        (
+            [{"a": 0, "b": 1, "c": "old"}],
+            [{"a": 0, "b": None, "c": "n"}],
+            ["a", "b"],
+            0,
+            1,
+            [{"a": 0, "b": 1, "c": "old"}, {"a": 0, "b": None, "c": "n"}],
+        ),
+        # Mixed: every combination in a single upsert. Three updates, one insert.
+        (
+            [
+                {"a": 0, "b": 1, "c": "old-01"},
+                {"a": 0, "b": None, "c": "old-0n"},
+                {"a": None, "b": None, "c": "old-nn"},
+            ],
+            [
+                {"a": 0, "b": 1, "c": "new-01"},
+                {"a": 0, "b": None, "c": "new-0n"},
+                {"a": None, "b": None, "c": "new-nn"},
+                {"a": 5, "b": 5, "c": "new-55"},
+            ],
+            ["a", "b"],
+            3,
+            1,
+            [
+                {"a": 0, "b": 1, "c": "new-01"},
+                {"a": 0, "b": None, "c": "new-0n"},
+                {"a": None, "b": None, "c": "new-nn"},
+                {"a": 5, "b": 5, "c": "new-55"},
+            ],
+        ),
+        # Inverse mismatch: Target has null, Source has value -> INSERT (1 != null).
+        (
+            [{"a": None, "b": 1, "c": "old"}],
+            [{"a": 2, "b": 1, "c": "new"}],
+            ["a", "b"],
+            0,
+            1,
+            [{"a": None, "b": 1, "c": "old"}, {"a": 2, "b": 1, "c": "new"}],
+        ),
+    ],
+    ids=[
+        "partial-null-key-updates",
+        "all-null-key-updates",
+        "null-source-beside-matching-row-inserts",
+        "null-source-no-target-match-inserts",
+        "mixed-null-truth-table",
+        "target-null-source-value-inserts",
+    ],
+)
+def test_upsert_null_safe_equality_semantics(
+    catalog: Catalog,
+    target_rows: list[dict[str, object]],
+    source_rows: list[dict[str, object]],
+    join_cols: list[str],
+    expected_updated: int,
+    expected_inserted: int,
+    expected_final: list[dict[str, object]],
+) -> None:
+    """Upsert join keys compare with null-safe equality (<=>), matching has_duplicate_rows."""
+    identifier = "default.test_upsert_null_safe_equality_semantics"
+    _drop_table(catalog, identifier)
+    fields = [(col, pa.int32()) for col in join_cols] + [("c", pa.string())]
+    schema = pa.schema(fields)
+    table = catalog.create_table(identifier, schema)
+    table.append(pa.Table.from_pylist(target_rows, schema=schema))
+
+    res = table.upsert(pa.Table.from_pylist(source_rows, schema=schema), join_cols=join_cols)
+    assert (res.rows_updated, res.rows_inserted) == (expected_updated, expected_inserted)
+
+    def key(r: dict[str, object]) -> tuple[object, ...]:
+        return tuple((r[col] is None, r[col]) for col in join_cols) + (r["c"],)
+
+    final = sorted(table.scan().to_arrow().to_pylist(), key=key)
+    assert final == sorted(expected_final, key=key)
+
+
+def test_upsert_partial_schema(catalog: Catalog) -> None:
+    """Verify that upserting with a subset of the table columns succeeds.
+    This tests the fix for the crash that occurred when attempting to cast the source
+    directly to the full target table schema.
+    """
+    identifier = "default.test_upsert_partial_schema"
+    _drop_table(catalog, identifier)
+
+    # Table has 3 columns: k, payload, and description
+    table_schema = pa.schema([("k", pa.int32()), ("payload", pa.string()), ("description", pa.string())])
+    table = catalog.create_table(identifier, table_schema)
+    table.append(
+        pa.Table.from_pylist(
+            [{"k": 1, "payload": "old", "description": "keep me"}],
+            schema=table_schema,
+        )
+    )
+
+    # Source only has 2 columns: k and payload (missing 'description')
+    source_schema = pa.schema([("k", pa.int32()), ("payload", pa.string())])
+    source = pa.Table.from_pylist([{"k": 1, "payload": "new"}], schema=source_schema)
+
+    # Should fail with a clear message explaining that partial schemas are not yet supported
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Partial schema updates are not yet supported. "
+            "The source dataframe is missing the following table columns: description"
+        ),
+    ):
+        table.upsert(source, join_cols=["k"])
+
+
+def test_upsert_extra_columns_fails(catalog: Catalog) -> None:
+    """Verify that upserting with columns NOT in the table is correctly rejected."""
+    identifier = "default.test_upsert_extra_columns_fails"
+    _drop_table(catalog, identifier)
+
+    table_schema = pa.schema([("k", pa.int32()), ("payload", pa.string())])
+    table = catalog.create_table(identifier, table_schema)
+
+    # Source has an extra column 'unknown'
+    source_schema = pa.schema([("k", pa.int32()), ("payload", pa.string()), ("unknown", pa.string())])
+    source = pa.Table.from_pylist([{"k": 1, "payload": "val", "unknown": "???"}], schema=source_schema)
+
+    with pytest.raises(ValueError, match="PyArrow table contains more columns: unknown"):
+        table.upsert(source, join_cols=["k"])
+
+
+@pytest.mark.parametrize(
+    "table_fields, source_fields, case_sensitive, expected_error, match",
+    [
+        # 1. Collision Fail: Table has 'ID' and 'id', case_sensitive=False -> Ambiguity Error
+        (
+            [("ID", pa.int32()), ("id", pa.string())],
+            [("ID", pa.int32()), ("id", pa.string())],
+            False,
+            ValueError,
+            "Case-insensitive upsert is ambiguous for this table because of name collisions: id",
+        ),
+        # 2. Collision Success: Table has 'ID' and 'id', case_sensitive=True -> OK
+        (
+            [("ID", pa.int32()), ("id", pa.string())],
+            [("ID", pa.int32()), ("id", pa.string())],
+            True,
+            None,
+            None,
+        ),
+        # 3. Missing Column (Case-Insensitive): Table has 'id', 'data',
+        # Source has 'ID' only, case_sensitive=False -> Missing 'data'
+        (
+            [("id", pa.int32()), ("data", pa.string())],
+            [("ID", pa.int32())],
+            False,
+            ValueError,
+            "The source dataframe is missing the following table columns: data",
+        ),
+        # 4. Standard Mismatch: Table has 'id', Source has 'ID', case_sensitive=True -> Guardrail catches missing 'id'
+        (
+            [("id", pa.int32())],
+            [("ID", pa.int32())],
+            True,
+            ValueError,
+            "The source dataframe is missing the following table columns: id",
+        ),
+    ],
+    ids=["collision_fail", "collision_ok", "missing_insensitive", "standard_mismatch"],
+)
+def test_upsert_case_sensitivity_scenarios(
+    catalog: Catalog,
+    table_fields: list[tuple[str, pa.DataType]],
+    source_fields: list[tuple[str, pa.DataType]],
+    case_sensitive: bool,
+    expected_error: type[Exception] | None,
+    match: str | None,
+) -> None:
+    """Verify that upsert correctly handles case-sensitivity edge cases like name collisions and mismatched casings."""
+    identifier = "default.test_upsert_case_sensitivity_scenarios"
+    try:
+        catalog.drop_table(identifier)
+    except NoSuchTableError:
+        pass
+
+    table = catalog.create_table(identifier, pa.schema(table_fields))
+    source = pa.Table.from_pylist(
+        [{f[0]: (1 if f[1] == pa.int32() else "val") for f in source_fields}],
+        schema=pa.schema(source_fields),
+    )
+
+    if expected_error:
+        with pytest.raises(expected_error, match=match):
+            table.upsert(source, join_cols=[table_fields[0][0]], case_sensitive=case_sensitive)
+    else:
+        table.upsert(source, join_cols=[table_fields[0][0]], case_sensitive=case_sensitive)

@@ -861,6 +861,34 @@ class Transaction:
         if not when_matched_update_all and not when_not_matched_insert_all:
             raise ValueError("no upsert options selected...exiting")
 
+        if not case_sensitive:
+            all_names = [field.name for field in self.table_metadata.schema().fields]
+            lower_names = [n.lower() for n in all_names]
+            if len(set(lower_names)) != len(all_names):
+                import collections
+
+                collisions = [item for item, count in collections.Counter(lower_names).items() if count > 1]
+                raise ValueError(
+                    f"Case-insensitive upsert is ambiguous for this table because of name collisions: {', '.join(collisions)}. "
+                    "Please use case_sensitive=True or rename the columns."
+                )
+
+        # Ensure all top-level table columns are present in the source to avoid silent data loss.
+        if case_sensitive:
+            table_cols = {field.name for field in self.table_metadata.schema().fields}
+            source_cols = set(df.column_names)
+        else:
+            table_cols = {field.name.lower() for field in self.table_metadata.schema().fields}
+            source_cols = {name.lower() for name in df.column_names}
+
+        missing_cols = table_cols - source_cols
+        if missing_cols:
+            raise ValueError(
+                f"Partial schema updates are not yet supported. The source dataframe is missing "
+                f"the following table columns: {', '.join(sorted(missing_cols))}. "
+                "Please provide all columns to avoid accidental data loss."
+            )
+
         if upsert_util.has_duplicate_rows(df, join_cols):
             raise ValueError("Duplicate rows found in source dataset based on the key columns. No upsert executed")
 
@@ -917,8 +945,9 @@ class Transaction:
                 expr_match_bound = bind(self.table_metadata.schema(), expr_match, case_sensitive=case_sensitive)
                 expr_match_arrow = expression_to_pyarrow(expr_match_bound)
 
-                # Filter rows per batch.
-                rows_to_insert = rows_to_insert.filter(~expr_match_arrow)
+                # Filter rows per batch. Treat null match (source key null vs non-null target key)
+                # as "no match" so the row reaches the insert path instead of being dropped.
+                rows_to_insert = rows_to_insert.filter(expr_match_arrow.is_null() | ~expr_match_arrow)
 
         update_row_cnt = 0
         insert_row_cnt = 0
