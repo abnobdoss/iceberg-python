@@ -595,6 +595,35 @@ def test_upsert_large_composite_key_initial_scan_does_not_recurse(tmp_path: Posi
     assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
 
 
+def test_create_match_filter_large_composite_key_binds_without_recursing() -> None:
+    script = textwrap.dedent(
+        """
+        import pyarrow as pa
+
+        from pyiceberg.expressions.visitors import bind
+        from pyiceberg.io.pyarrow import expression_to_pyarrow
+        from pyiceberg.schema import Schema
+        from pyiceberg.table.upsert_util import create_match_filter
+        from pyiceberg.types import LongType, NestedField
+
+        n = 30_000
+        table = pa.table({
+            "order_id": pa.array(range(n), type=pa.int64()),
+            "order_line_id": pa.array(range(100_000, 100_000 + n), type=pa.int64()),
+        })
+        expr = create_match_filter(table, ["order_id", "order_line_id"])
+        schema = Schema(
+            NestedField(1, "order_id", LongType(), required=False),
+            NestedField(2, "order_line_id", LongType(), required=False),
+        )
+        expression_to_pyarrow(bind(schema, expr, case_sensitive=True))
+        """
+    )
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=False)
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+
 def test_upsert_with_duplicate_rows_in_table(catalog: Catalog) -> None:
     identifier = "default.test_upsert_with_duplicate_rows_in_table"
 
