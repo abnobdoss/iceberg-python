@@ -82,6 +82,7 @@ from pyiceberg.table.update.statistics import UpdateStatistics
 from pyiceberg.transforms import IdentityTransform
 from pyiceberg.typedef import (
     EMPTY_DICT,
+    ArrowStreamExportable,
     IcebergBaseModel,
     IcebergRootModel,
     Identifier,
@@ -452,7 +453,7 @@ class Transaction:
 
     def append(
         self,
-        df: pa.Table | pa.RecordBatchReader,
+        df: pa.Table | pa.RecordBatchReader | ArrowStreamExportable,
         snapshot_properties: dict[str, str] = EMPTY_DICT,
         branch: str | None = MAIN_BRANCH,
     ) -> None:
@@ -505,10 +506,9 @@ class Transaction:
         except ModuleNotFoundError as e:
             raise ModuleNotFoundError("For writes PyArrow needs to be installed") from e
 
-        from pyiceberg.io.pyarrow import _check_pyarrow_schema_compatible, _dataframe_to_data_files
+        from pyiceberg.io.pyarrow import _check_pyarrow_schema_compatible, _coerce_arrow_input, _dataframe_to_data_files
 
-        if not isinstance(df, (pa.Table, pa.RecordBatchReader)):
-            raise ValueError(f"Expected pa.Table or pa.RecordBatchReader, got: {df}")
+        df = _coerce_arrow_input(df)
 
         downcast_ns_timestamp_to_us = Config().get_bool(DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE) or False
         _check_pyarrow_schema_compatible(
@@ -598,7 +598,7 @@ class Transaction:
 
     def overwrite(
         self,
-        df: pa.Table | pa.RecordBatchReader,
+        df: pa.Table | pa.RecordBatchReader | ArrowStreamExportable,
         overwrite_filter: BooleanExpression | str = ALWAYS_TRUE,
         snapshot_properties: dict[str, str] = EMPTY_DICT,
         case_sensitive: bool = True,
@@ -662,10 +662,9 @@ class Transaction:
         except ModuleNotFoundError as e:
             raise ModuleNotFoundError("For writes PyArrow needs to be installed") from e
 
-        from pyiceberg.io.pyarrow import _check_pyarrow_schema_compatible, _dataframe_to_data_files
+        from pyiceberg.io.pyarrow import _check_pyarrow_schema_compatible, _coerce_arrow_input, _dataframe_to_data_files
 
-        if not isinstance(df, (pa.Table, pa.RecordBatchReader)):
-            raise ValueError(f"Expected pa.Table or pa.RecordBatchReader, got: {df}")
+        df = _coerce_arrow_input(df)
 
         downcast_ns_timestamp_to_us = Config().get_bool(DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE) or False
         _check_pyarrow_schema_compatible(
@@ -1472,7 +1471,7 @@ class Table:
 
     def append(
         self,
-        df: pa.Table | pa.RecordBatchReader,
+        df: pa.Table | pa.RecordBatchReader | ArrowStreamExportable,
         snapshot_properties: dict[str, str] = EMPTY_DICT,
         branch: str | None = MAIN_BRANCH,
     ) -> None:
@@ -1507,7 +1506,7 @@ class Table:
 
     def overwrite(
         self,
-        df: pa.Table | pa.RecordBatchReader,
+        df: pa.Table | pa.RecordBatchReader | ArrowStreamExportable,
         overwrite_filter: BooleanExpression | str = ALWAYS_TRUE,
         snapshot_properties: dict[str, str] = EMPTY_DICT,
         case_sensitive: bool = True,
@@ -1715,6 +1714,10 @@ class Table:
             file_io_properties=self.io.properties,
         ).__datafusion_table_provider__
         return provider(session)
+
+    def __arrow_c_stream__(self, requested_schema: object | None = None) -> object:
+        """Export this Table as an Arrow C stream (PyCapsule interface)."""
+        return self.scan().to_arrow_batch_reader().__arrow_c_stream__(requested_schema)
 
 
 class StaticTable(Table):
@@ -2251,6 +2254,10 @@ class DataScan(TableScan):
             target_schema,
             batches,
         ).cast(target_schema)
+
+    def __arrow_c_stream__(self, requested_schema: object | None = None) -> object:
+        """Export this scan's result as an Arrow C stream (PyCapsule interface)."""
+        return self.to_arrow_batch_reader().__arrow_c_stream__(requested_schema)
 
     def to_pandas(self, **kwargs: Any) -> pd.DataFrame:
         """Read a Pandas DataFrame eagerly from this Iceberg table.
