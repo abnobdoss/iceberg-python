@@ -62,7 +62,7 @@ from pyiceberg.table.name_mapping import NameMapping
 from pyiceberg.typedef import Record
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Iterator
 
 
 def _core_module(name: str) -> Any:
@@ -433,6 +433,29 @@ class _ShardedBatchStream:
         readers.clear()
 
 
+def _limited_batches(source: Any, limit: int) -> Iterator[Any]:
+    """Yield batches from ``source`` until ``limit`` rows have been emitted, then stop.
+
+    The batch that crosses the limit is sliced, and the underlying source is closed so a sharded
+    scan stops decoding early instead of draining every file. An Iceberg scan limit has no ordering
+    guarantee, so returning the first ``limit`` rows the readers produce is correct.
+    """
+    remaining = limit
+    try:
+        for batch in source:
+            if remaining <= 0:
+                break
+            if batch.num_rows > remaining:
+                yield batch.slice(0, remaining)
+                break
+            remaining -= batch.num_rows
+            yield batch
+    finally:
+        close = getattr(source, "close", None)
+        if close is not None:
+            close()
+
+
 def arrow_batch_reader_from_pyiceberg_core(
     file_io: FileIO,
     tasks: Iterable[FileScanTask],
@@ -441,6 +464,7 @@ def arrow_batch_reader_from_pyiceberg_core(
     partition_specs: dict[int, PartitionSpec],
     name_mapping: NameMapping | None,
     case_sensitive: bool = True,
+    limit: int | None = None,
 ) -> Any:
     """Read PyIceberg scan tasks through pyiceberg-core's ArrowReader as a streaming reader.
 
@@ -469,20 +493,28 @@ def arrow_batch_reader_from_pyiceberg_core(
 
     core_projection = schema_to_pyiceberg_core(projected_schema)
     reader_kwargs = _reader_kwargs()
+    if limit is not None:
+        # No point decoding a full default-sized batch per shard just to truncate to a small limit.
+        reader_kwargs["batch_size"] = max(1, min(reader_kwargs["batch_size"], limit))
 
     def _read(shard_tasks: list[Any]) -> Any:
         reader = _core_module("scan").ArrowReader(file_io_to_pyiceberg_core(file_io), **reader_kwargs)
         return reader.read(core_projection, shard_tasks)
 
+    import pyarrow as pa
+
     shards = _shard_count(len(core_tasks))
     if shards <= 1 or len(core_tasks) <= 1:
-        return _read(core_tasks)
-
-    import pyarrow as pa
+        reader = _read(core_tasks)
+        if limit is None:
+            return reader
+        return pa.RecordBatchReader.from_batches(reader.schema, _limited_batches(reader, limit))
 
     groups = [g for g in (core_tasks[i::shards] for i in range(shards)) if g]
     readers = [_read(group) for group in groups]
     # Every native reader carries the same projected Arrow schema; use it to type the stream.
     arrow_schema = readers[0].schema
-    stream = _ShardedBatchStream(readers)
+    stream: Any = _ShardedBatchStream(readers)
+    if limit is not None:
+        stream = _limited_batches(stream, limit)
     return pa.RecordBatchReader.from_batches(arrow_schema, stream)

@@ -28,6 +28,7 @@ import pytest
 from pyiceberg.expressions import And, EqualTo, IsNull, StartsWith
 from pyiceberg.io import FileIO, InputFile, OutputFile
 from pyiceberg.io.pyiceberg_core import (
+    _limited_batches,
     _ShardedBatchStream,
     arrow_batch_reader_from_pyiceberg_core,
     can_read_projected_schema_with_pyiceberg_core,
@@ -531,7 +532,54 @@ def test_arrow_batch_reader_single_shard_returns_native_reader_directly(monkeypa
     assert reader is native
 
 
-def _build_reader(monkeypatch: pytest.MonkeyPatch, n_tasks: int) -> Any:
+def test_limited_batches_truncates_to_limit_and_closes_source() -> None:
+    class ClosableSource:
+        def __init__(self, batches: list[pa.RecordBatch]) -> None:
+            self._it = iter(batches)
+            self.closed = False
+
+        def __iter__(self) -> ClosableSource:
+            return self
+
+        def __next__(self) -> pa.RecordBatch:
+            return next(self._it)
+
+        def close(self) -> None:
+            self.closed = True
+
+    source = ClosableSource([_batch([1, 2, 3]), _batch([4, 5, 6]), _batch([7, 8, 9])])
+    out = list(_limited_batches(source, 4))
+
+    rows = [v for batch in out for v in batch["id"].to_pylist()]
+    assert rows == [1, 2, 3, 4]  # the batch crossing the limit is sliced
+    assert source.closed  # the underlying source is closed so a sharded scan stops decoding early
+
+
+def test_arrow_batch_reader_applies_limit_across_shards(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured_batch_size: list[Any] = []
+    shard_readers = [
+        FakeShardReader([_batch([1, 2]), _batch([3, 4])]),
+        FakeShardReader([_batch([5, 6]), _batch([7, 8])]),
+    ]
+
+    class FakeArrowReader:
+        def __init__(self, _file_io: Any, **kwargs: Any) -> None:
+            captured_batch_size.append(kwargs.get("batch_size"))
+
+        def read(self, _projection: Any, _tasks: list[Any]) -> FakeShardReader:
+            return shard_readers.pop(0)
+
+    monkeypatch.setattr(sys.modules["pyiceberg_core.scan"], "ArrowReader", FakeArrowReader)
+    monkeypatch.setenv("PYICEBERG_RUST_ARROW_SHARDS", "2")
+
+    reader = _build_reader(monkeypatch, n_tasks=4, limit=3)
+    table = reader.read_all()
+
+    assert table.num_rows == 3  # the global limit is enforced across shards, not per shard
+    assert captured_batch_size == [3, 3]  # batch size is capped to the limit so small limits don't over-decode
+
+
+def _build_reader(monkeypatch: pytest.MonkeyPatch, n_tasks: int, limit: int | None = None) -> Any:
     """Drive ``arrow_batch_reader_from_pyiceberg_core`` with ``n_tasks`` trivial data-file tasks."""
 
     def _identity_task_conversion(task: Any, *_args: Any, **_kwargs: Any) -> Any:
@@ -571,4 +619,5 @@ def _build_reader(monkeypatch: pytest.MonkeyPatch, n_tasks: int) -> Any:
         {0: PartitionSpec(spec_id=0)},
         None,
         True,
+        limit=limit,
     )
