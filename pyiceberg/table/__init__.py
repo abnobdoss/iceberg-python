@@ -115,6 +115,10 @@ PYICEBERG_RUST_ARROW_SCAN = "PYICEBERG_RUST_ARROW_SCAN"
 PYICEBERG_RUST_SCAN_PLANNING = "PYICEBERG_RUST_SCAN_PLANNING"
 
 
+def _env_flag_enabled(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"1", "true", "yes"}
+
+
 def _native_scan_supports_paths(tasks: Iterable[FileScanTask]) -> bool:
     """Return whether every planned data file has a URL scheme the native opendal reader can open.
 
@@ -2257,6 +2261,9 @@ class DataScan(TableScan):
         Returns:
             pa.Table: Materialized Arrow Table from the Iceberg table's DataScan
         """
+        if _env_flag_enabled(PYICEBERG_RUST_ARROW_SCAN) or _env_flag_enabled(PYICEBERG_RUST_SCAN_PLANNING):
+            return self.to_arrow_batch_reader().read_all()
+
         from pyiceberg.io.pyarrow import ArrowScan
 
         return ArrowScan(
@@ -2290,7 +2297,7 @@ class DataScan(TableScan):
         # ArrowInvalid for prop/decode mismatches; broader user errors still surface.
         native_fallback_errors = (ModuleNotFoundError, NotImplementedError, ValueError, TypeError, pa.lib.ArrowInvalid)
 
-        if os.environ.get(PYICEBERG_RUST_SCAN_PLANNING, "").lower() in {"1", "true", "yes"}:
+        if _env_flag_enabled(PYICEBERG_RUST_SCAN_PLANNING):
             from pyiceberg.io.pyiceberg_core import plan_and_read_with_pyiceberg_core
 
             try:
@@ -2313,7 +2320,7 @@ class DataScan(TableScan):
                     stacklevel=2,
                 )
 
-        if os.environ.get(PYICEBERG_RUST_ARROW_SCAN, "").lower() in {"1", "true", "yes"}:
+        if _env_flag_enabled(PYICEBERG_RUST_ARROW_SCAN):
             from pyiceberg.io.pyiceberg_core import (
                 arrow_batch_reader_from_pyiceberg_core,
                 can_read_projected_schema_with_pyiceberg_core,

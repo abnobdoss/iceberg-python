@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pyarrow as pa
 import pytest
 
 from pyiceberg.table import Table
@@ -124,3 +125,25 @@ def test_data_scan_plan_files_resolves_local_by_default(table_v2: Table) -> None
 
     assert scan.scan_planner is None
     assert isinstance(resolve_scan_planner(scan), LocalScanPlanner)
+
+
+def test_data_scan_to_arrow_uses_native_batch_reader_when_requested(
+    monkeypatch: pytest.MonkeyPatch,
+    table_v2: Table,
+) -> None:
+    schema = pa.schema([pa.field("id", pa.int32())])
+    batch = pa.record_batch({"id": pa.array([1, 2], type=pa.int32())})
+    scan = table_v2.scan().select("id")
+    seen: list[Any] = []
+
+    def _batch_reader(self: Any) -> pa.RecordBatchReader:
+        seen.append(self)
+        return pa.RecordBatchReader.from_batches(schema, [batch])
+
+    monkeypatch.setenv("PYICEBERG_RUST_ARROW_SCAN", "1")
+    monkeypatch.setattr(type(scan), "to_arrow_batch_reader", _batch_reader)
+
+    table = scan.to_arrow()
+
+    assert seen == [scan]
+    assert table.column("id").to_pylist() == [1, 2]
