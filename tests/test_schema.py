@@ -878,7 +878,7 @@ def should_promote(file_type: IcebergType, read_type: IcebergType) -> bool:
     if isinstance(file_type, BinaryType) and isinstance(read_type, StringType):
         return True
     if isinstance(file_type, DecimalType) and isinstance(read_type, DecimalType):
-        return file_type.precision <= read_type.precision and file_type.scale == file_type.scale
+        return file_type.precision <= read_type.precision and file_type.scale == read_type.scale
     if isinstance(file_type, FixedType) and isinstance(read_type, UUIDType) and len(file_type) == 16:
         return True
     return False
@@ -943,6 +943,11 @@ def test_promotion(file_type: IcebergType, read_type: IcebergType) -> None:
     else:
         with pytest.raises(ResolveError):
             promote(file_type, read_type)
+
+
+def test_decimal_promotion_rejects_mismatched_scale() -> None:
+    with pytest.raises(ResolveError):
+        promote(DecimalType(9, 2), DecimalType(10, 3))
 
 
 def test_unknown_type_promotion_to_primitive() -> None:
