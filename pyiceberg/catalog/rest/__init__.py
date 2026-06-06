@@ -31,7 +31,14 @@ from typing_extensions import override
 
 from pyiceberg import __version__
 from pyiceberg.catalog import BOTOCORE_SESSION, TOKEN, URI, WAREHOUSE_LOCATION, Catalog, PropertiesUpdateSummary
-from pyiceberg.catalog.rest.auth import AUTH_MANAGER, AuthManager, AuthManagerAdapter, AuthManagerFactory, LegacyOAuth2AuthManager
+from pyiceberg.catalog.rest.auth import (
+    AUTH_MANAGER,
+    AuthManager,
+    AuthManagerAdapter,
+    AuthManagerFactory,
+    LegacyOAuth2AuthManager,
+    NoopAuthManager,
+)
 from pyiceberg.catalog.rest.response import _handle_non_200_response
 from pyiceberg.catalog.rest.scan_planning import (
     FetchScanTasksRequest,
@@ -1227,14 +1234,17 @@ class RestCatalog(Catalog):
         table_identifier = TableIdentifier(namespace=identifier[:-1], name=identifier[-1])
         table_request = CommitTableRequest(identifier=table_identifier, requirements=requirements, updates=updates)
 
-        headers = self._session.headers
+        headers = dict(self._session.headers)
+        request_kwargs: dict[str, Any] = {}
         if table_token := table.config.get(TOKEN):
             headers[AUTHORIZATION_HEADER] = f"{BEARER_PREFIX} {table_token}"
+            request_kwargs["auth"] = AuthManagerAdapter(NoopAuthManager())
 
         response = self._session.post(
             self.url(Endpoints.update_table, prefixed=True, **self._split_identifier_for_path(table_request.identifier)),
             data=table_request.model_dump_json().encode(UTF8),
             headers=headers,
+            **request_kwargs,
         )
         try:
             response.raise_for_status()
