@@ -1151,6 +1151,12 @@ def test_strict_some_nulls(strict_data_file_schema: Schema, strict_data_file_2: 
     should_read = _StrictMetricsEvaluator(strict_data_file_schema, EqualTo("some_nulls", "bbb")).eval(strict_data_file_3)
     assert not should_read, "Should not match: equal on some nulls column"
 
+    should_read = _StrictMetricsEvaluator(strict_data_file_schema, NotEqualTo("some_nulls", "aaa")).eval(strict_data_file_2)
+    assert should_read, "Should match: notEqual when all known values are above the literal"
+
+    should_read = _StrictMetricsEvaluator(strict_data_file_schema, NotEqualTo("some_nulls", "bbb")).eval(strict_data_file_2)
+    assert not should_read, "Should not match: notEqual when the literal may be present"
+
 
 def test_strict_is_nan(strict_data_file_schema: Schema, strict_data_file_1: DataFile) -> None:
     should_read = _StrictMetricsEvaluator(strict_data_file_schema, IsNaN("all_nans")).eval(strict_data_file_1)
@@ -1158,6 +1164,12 @@ def test_strict_is_nan(strict_data_file_schema: Schema, strict_data_file_1: Data
 
     should_read = _StrictMetricsEvaluator(strict_data_file_schema, IsNaN("some_nans")).eval(strict_data_file_1)
     assert not should_read, "Should not match: at least one non-nan value in some nan column"
+
+    should_read = _StrictMetricsEvaluator(strict_data_file_schema, NotEqualTo("all_nans", 1.0)).eval(strict_data_file_1)
+    assert should_read, "Should match: notEqual on all nan column"
+
+    should_read = _StrictMetricsEvaluator(strict_data_file_schema, NotEqualTo("some_nans", 1.0)).eval(strict_data_file_1)
+    assert not should_read, "Should not match: notEqual on some nans column without bounds"
 
     should_read = _StrictMetricsEvaluator(strict_data_file_schema, IsNaN("no_nans")).eval(strict_data_file_1)
     assert not should_read, "Should not match: at least one non-nan value in no nan column"

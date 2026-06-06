@@ -1668,7 +1668,7 @@ class _StrictMetricsEvaluator(_MetricsEvaluator):
         # Rows must match when X < Min or Max < X because it is not in the range
         field_id = term.ref().field.field_id
 
-        if self._can_contain_nulls(field_id) or self._can_contain_nans(field_id):
+        if self._contains_nulls_only(field_id) or self._contains_nans_only(field_id):
             return ROWS_MUST_MATCH
 
         field = self._get_field(field_id)
