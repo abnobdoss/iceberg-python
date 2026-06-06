@@ -19,6 +19,10 @@
 from __future__ import annotations
 
 import importlib
+import os
+import threading
+import weakref
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING, Any
 
 from pyiceberg.expressions import (
@@ -303,6 +307,132 @@ def file_scan_task_to_pyiceberg_core(
     )
 
 
+# Rows per Arrow batch handed back from the native reader. The native default emits very small
+# batches, and the sharded fan-in marshals every batch back through the GIL-holding consumer, so a
+# tiny batch makes per-batch Python orchestration dominate the decode (measured ~3x slower than a
+# whole-shard drain). A larger batch amortizes that handoff while keeping in-flight memory bounded
+# to shards x batch (so the streaming contract still holds). Override with
+# PYICEBERG_RUST_ARROW_BATCH_SIZE.
+_DEFAULT_ARROW_BATCH_SIZE = 262144
+
+
+def _reader_kwargs() -> dict[str, int]:
+    batch_size = os.environ.get("PYICEBERG_RUST_ARROW_BATCH_SIZE")
+    kwargs: dict[str, int] = {"batch_size": int(batch_size) if batch_size else _DEFAULT_ARROW_BATCH_SIZE}
+    concurrency = os.environ.get("PYICEBERG_RUST_ARROW_FILE_CONCURRENCY")
+    if concurrency:
+        kwargs["data_file_concurrency_limit"] = int(concurrency)
+    return kwargs
+
+
+def _shard_count(n_tasks: int) -> int:
+    """How many decode threads to fan out across.
+
+    The native ArrowReader decodes a single stream on one core (it parallelizes I/O, not CPU
+    decode), so a single-stream read of many files leaves the box idle. Sharding the file tasks
+    across threads — each driving its own reader — recovers multi-core decode (the GIL is released
+    during the C-stream drain). Default scales with cores, capped so tiny scans don't pay thread
+    overhead; override with PYICEBERG_RUST_ARROW_SHARDS (1 disables sharding).
+    """
+    override = os.environ.get("PYICEBERG_RUST_ARROW_SHARDS")
+    if override:
+        return max(1, int(override))
+    if n_tasks <= 1:
+        return 1
+    return max(1, min(n_tasks, (os.cpu_count() or 1)))
+
+
+class _ShardedBatchStream:
+    """Generator-backed, backpressured fan-in over several native shard readers.
+
+    Each shard owns one ``pyiceberg_core`` ``RecordBatchReader`` and is drained sequentially (a
+    stateful reader must not be polled concurrently), so at most one read per shard is ever in
+    flight. A ``ThreadPoolExecutor`` pulls the *next* batch from every idle shard at once and the
+    consumer is handed batches as they complete, so decode runs on up to ``n_shards`` cores (the
+    GIL is released during the C-stream drain). Peak memory is bounded to at most one decoded
+    batch per shard plus what the consumer holds — never the whole result — because a shard is not
+    asked for its next batch until its current one has been handed out (backpressure: a slow
+    consumer stalls the shards rather than buffering ahead).
+
+    Batches are yielded as they complete (``FIRST_COMPLETED``); ordering across shards is not
+    preserved, which is sound because the scan result is an unordered union of file tasks. Worker
+    exceptions are re-raised to the consumer, and the pool is shut down on exhaustion, on an
+    exception during iteration, on an explicit :meth:`close`, or — for a consumer that simply
+    stops iterating and drops the reader — via the ``weakref`` finalizer at garbage collection.
+    """
+
+    def __init__(self, readers: list[Any]) -> None:
+        self._readers = readers
+        self._pool = ThreadPoolExecutor(max_workers=len(readers))
+        # Shard indices whose reader is idle and not yet known to be exhausted.
+        self._idle: list[int] = list(range(len(readers)))
+        self._in_flight: dict[Future[Any], int] = {}
+        self._closed = False
+        self._lock = threading.Lock()
+        # Shut the pool down if the consumer abandons the iterator without closing it.
+        self._finalizer = weakref.finalize(self, self._shutdown, self._pool, self._readers)
+
+    @staticmethod
+    def _next_batch(reader: Any) -> Any | None:
+        """Pull one batch from a shard reader, returning ``None`` when the shard is exhausted."""
+        try:
+            return reader.read_next_batch()
+        except StopIteration:
+            return None
+
+    def _submit_idle(self) -> None:
+        """Submit the next read for every idle, non-exhausted shard (one read per shard)."""
+        while self._idle:
+            shard = self._idle.pop()
+            future = self._pool.submit(self._next_batch, self._readers[shard])
+            self._in_flight[future] = shard
+
+    def __iter__(self) -> _ShardedBatchStream:
+        return self
+
+    def __next__(self) -> Any:
+        if self._closed:
+            raise StopIteration
+        try:
+            while True:
+                self._submit_idle()
+                if not self._in_flight:
+                    # Every shard is exhausted: the union is complete.
+                    self.close()
+                    raise StopIteration
+                done, _ = wait(self._in_flight, return_when=FIRST_COMPLETED)
+                for future in done:
+                    shard = self._in_flight.pop(future)
+                    batch = future.result()  # re-raises any worker exception here
+                    if batch is None:
+                        continue  # shard exhausted; do not return it to the idle set
+                    # Shard produced a batch: it may have more, so mark it idle again.
+                    self._idle.append(shard)
+                    return batch
+        except StopIteration:
+            raise
+        except BaseException:
+            # Worker exception, GeneratorExit, or KeyboardInterrupt: tear the workers down so an
+            # aborted scan never leaves decode threads running.
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """Cancel pending work and release shard readers; idempotent and consumer-safe."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._finalizer.detach()
+        self._shutdown(self._pool, self._readers)
+
+    @staticmethod
+    def _shutdown(pool: ThreadPoolExecutor, readers: list[Any]) -> None:
+        # cancel_futures drops queued reads; in-flight reads are joined so no thread outlives us.
+        pool.shutdown(wait=True, cancel_futures=True)
+        readers.clear()
+
+
 def arrow_batch_reader_from_pyiceberg_core(
     file_io: FileIO,
     tasks: Iterable[FileScanTask],
@@ -312,7 +442,18 @@ def arrow_batch_reader_from_pyiceberg_core(
     name_mapping: NameMapping | None,
     case_sensitive: bool = True,
 ) -> Any:
-    """Read PyIceberg scan tasks through pyiceberg-core's ArrowReader."""
+    """Read PyIceberg scan tasks through pyiceberg-core's ArrowReader as a streaming reader.
+
+    Multi-file scans are sharded across a thread pool (see ``_shard_count``) so decode uses
+    multiple cores; a single native reader over all files would decode on one core. Each shard
+    drives its own native ``RecordBatchReader``; the returned ``pyarrow.RecordBatchReader`` pulls
+    batches from the shards lazily (at most one decoded batch per shard in flight), so the whole
+    result is never materialized and peak memory stays bounded. The single-file or single-shard
+    case skips the fan-out entirely and returns the native reader directly.
+
+    Worker-thread exceptions propagate to the consumer, and the shard threads are shut down when
+    the reader is exhausted, closed early, or garbage collected.
+    """
     core_tasks = [
         file_scan_task_to_pyiceberg_core(
             task,
@@ -326,5 +467,22 @@ def arrow_batch_reader_from_pyiceberg_core(
         for task in tasks
     ]
 
-    reader = _core_module("scan").ArrowReader(file_io_to_pyiceberg_core(file_io))
-    return reader.read(schema_to_pyiceberg_core(projected_schema), core_tasks)
+    core_projection = schema_to_pyiceberg_core(projected_schema)
+    reader_kwargs = _reader_kwargs()
+
+    def _read(shard_tasks: list[Any]) -> Any:
+        reader = _core_module("scan").ArrowReader(file_io_to_pyiceberg_core(file_io), **reader_kwargs)
+        return reader.read(core_projection, shard_tasks)
+
+    shards = _shard_count(len(core_tasks))
+    if shards <= 1 or len(core_tasks) <= 1:
+        return _read(core_tasks)
+
+    import pyarrow as pa
+
+    groups = [g for g in (core_tasks[i::shards] for i in range(shards)) if g]
+    readers = [_read(group) for group in groups]
+    # Every native reader carries the same projected Arrow schema; use it to type the stream.
+    arrow_schema = readers[0].schema
+    stream = _ShardedBatchStream(readers)
+    return pa.RecordBatchReader.from_batches(arrow_schema, stream)

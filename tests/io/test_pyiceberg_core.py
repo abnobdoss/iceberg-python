@@ -18,14 +18,18 @@
 from __future__ import annotations
 
 import sys
+import threading
 from types import ModuleType
 from typing import Any
 
+import pyarrow as pa
 import pytest
 
 from pyiceberg.expressions import And, EqualTo, IsNull, StartsWith
 from pyiceberg.io import FileIO, InputFile, OutputFile
 from pyiceberg.io.pyiceberg_core import (
+    _ShardedBatchStream,
+    arrow_batch_reader_from_pyiceberg_core,
     can_read_projected_schema_with_pyiceberg_core,
     delete_file_to_pyiceberg_core,
     expression_to_pyiceberg_core,
@@ -122,6 +126,7 @@ def fake_pyiceberg_core(monkeypatch: pytest.MonkeyPatch) -> None:
     scan: Any = ModuleType("pyiceberg_core.scan")
     scan.DeleteFile = CoreObject
     scan.FileScanTask = CoreObject
+    scan.ArrowReader = CoreObject  # streaming tests override this with a batch-producing fake
 
     monkeypatch.setitem(sys.modules, "pyiceberg_core", root)
     monkeypatch.setitem(sys.modules, "pyiceberg_core.schema", schema)
@@ -322,3 +327,248 @@ def test_file_scan_task_to_pyiceberg_core_requires_partition_spec_for_partitione
 
     with pytest.raises(ValueError, match="partition_spec is required"):
         file_scan_task_to_pyiceberg_core(FileScanTask(data_file), simple_schema)
+
+
+# --- streaming sharded reader -------------------------------------------------
+
+_STREAM_SCHEMA = pa.schema([("id", pa.int64())])
+
+
+def _batch(values: list[int]) -> pa.RecordBatch:
+    return pa.record_batch({"id": pa.array(values, type=pa.int64())})
+
+
+class FakeShardReader:
+    """A stand-in for a native ``pyiceberg_core`` RecordBatchReader over one shard's tasks."""
+
+    def __init__(self, batches: list[pa.RecordBatch]) -> None:
+        self._batches = list(batches)
+        self._pos = 0
+        self.schema = _STREAM_SCHEMA
+
+    def read_next_batch(self) -> pa.RecordBatch:
+        if self._pos >= len(self._batches):
+            raise StopIteration
+        batch = self._batches[self._pos]
+        self._pos += 1
+        return batch
+
+
+def _drain(reader: pa.RecordBatchReader) -> tuple[int, int]:
+    """Return (row_count, sum-of-id checksum) — the same parity signal used in the perf gate."""
+    table = reader.read_all()
+    rows = table.num_rows
+    checksum = pa.compute.sum(table["id"]).as_py() or 0
+    return rows, checksum
+
+
+def test_sharded_batch_stream_preserves_all_rows_and_checksum() -> None:
+    # Uneven shards exercise the "one shard finishes early" path of the fan-in.
+    readers = [
+        FakeShardReader([_batch([1, 2]), _batch([3])]),
+        FakeShardReader([_batch([4, 5, 6])]),
+        FakeShardReader([]),  # an empty shard must not stall the union
+    ]
+    expected_rows = 6
+    expected_sum = 21
+
+    stream = _ShardedBatchStream(readers)
+    reader = pa.RecordBatchReader.from_batches(_STREAM_SCHEMA, stream)
+
+    assert _drain(reader) == (expected_rows, expected_sum)
+
+
+def test_arrow_batch_reader_streams_lazily_without_materializing(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The legacy implementation called read_all() per shard up front; assert the new path does not
+    # pull any batch until the consumer asks for one (the streaming contract).
+    pulled: list[int] = []
+
+    class ObservingReader(FakeShardReader):
+        def read_next_batch(self) -> pa.RecordBatch:
+            batch = super().read_next_batch()
+            pulled.append(batch.num_rows)
+            return batch
+
+    shard_readers = [ObservingReader([_batch([1]), _batch([2])]), ObservingReader([_batch([3]), _batch([4])])]
+
+    class FakeArrowReader:
+        def __init__(self, _file_io: Any, **_kwargs: Any) -> None:
+            pass
+
+        def read(self, _projection: Any, _tasks: list[Any]) -> ObservingReader:
+            return shard_readers.pop(0)
+
+    monkeypatch.setattr(sys.modules["pyiceberg_core.scan"], "ArrowReader", FakeArrowReader)
+    monkeypatch.setenv("PYICEBERG_RUST_ARROW_SHARDS", "2")
+
+    reader = _build_reader(monkeypatch, n_tasks=2)
+    assert pulled == []  # construction must not drain anything
+
+    first = reader.read_next_batch()
+    assert first.num_rows == 1
+    # Backpressure: at most one read per shard is outstanding, so the first pull never drains all 4.
+    assert len(pulled) < 4
+
+    rows, checksum = _drain(reader)
+    assert (rows + first.num_rows, checksum + first["id"][0].as_py()) == (4, 1 + 2 + 3 + 4)
+
+
+def test_sharded_batch_stream_bounds_in_flight_reads() -> None:
+    # Each shard read parks on a gate; assert no more than one read per shard is ever outstanding,
+    # so peak memory is bounded to one decoded batch per shard rather than the whole result. A
+    # shard must not be asked for its next batch until its current one is consumed (backpressure).
+    n_shards = 5
+    release = threading.Event()
+    started = threading.Semaphore(0)
+    concurrent = 0
+    peak = 0
+    lock = threading.Lock()
+
+    class GatedReader:
+        def __init__(self) -> None:
+            self.schema = _STREAM_SCHEMA
+            self._remaining = 4
+
+        def read_next_batch(self) -> pa.RecordBatch:
+            nonlocal concurrent, peak
+            if self._remaining <= 0:
+                raise StopIteration
+            self._remaining -= 1
+            with lock:
+                concurrent += 1
+                peak = max(peak, concurrent)
+            started.release()
+            release.wait(timeout=5)
+            with lock:
+                concurrent -= 1
+            return _batch([1])
+
+    stream = _ShardedBatchStream([GatedReader() for _ in range(n_shards)])
+
+    consumer = threading.Thread(target=lambda: list(stream))
+    consumer.start()
+    # All shards start their first read and park. An (n_shards + 1)th concurrent start would mean a
+    # shard was double-polled; assert it does not happen while the gate is closed.
+    for _ in range(n_shards):
+        assert started.acquire(timeout=5)
+    assert not started.acquire(timeout=0.2), "a shard was polled twice before its batch was consumed"
+    with lock:
+        assert peak <= n_shards
+
+    release.set()
+    consumer.join(timeout=10)
+    assert not consumer.is_alive()
+    assert peak <= n_shards
+
+
+def test_sharded_batch_stream_propagates_worker_exceptions() -> None:
+    class BoomReader:
+        def __init__(self) -> None:
+            self.schema = _STREAM_SCHEMA
+
+        def read_next_batch(self) -> pa.RecordBatch:
+            raise RuntimeError("native decode failed")
+
+    stream = _ShardedBatchStream([FakeShardReader([_batch([1])]), BoomReader()])
+    reader = pa.RecordBatchReader.from_batches(_STREAM_SCHEMA, stream)
+
+    with pytest.raises(RuntimeError, match="native decode failed"):
+        reader.read_all()
+
+    # The pool must be torn down (no leaked worker threads) once the error surfaced.
+    assert stream._closed
+    assert stream._pool._shutdown
+
+
+def test_sharded_batch_stream_shuts_down_on_early_close() -> None:
+    readers = [FakeShardReader([_batch([i]) for i in range(10)]) for _ in range(3)]
+    stream = _ShardedBatchStream(readers)
+
+    first = next(stream)
+    assert first.num_rows == 1
+
+    stream.close()
+    assert stream._closed
+    assert stream._pool._shutdown
+    # close() is idempotent and a closed stream is exhausted.
+    stream.close()
+    with pytest.raises(StopIteration):
+        next(stream)
+
+
+def test_sharded_batch_stream_shuts_down_on_garbage_collection() -> None:
+    import gc
+    import weakref
+
+    readers = [FakeShardReader([_batch([i]) for i in range(50)]) for _ in range(3)]
+    stream = _ShardedBatchStream(readers)
+    pool = stream._pool
+
+    next(stream)  # leave the pool and workers live, then abandon the stream without close()
+    ref = weakref.ref(stream)
+    del stream
+    gc.collect()
+
+    assert ref() is None  # no lingering references kept the stream (and its threads) alive
+    assert pool._shutdown  # the finalizer tore the pool down
+
+
+def test_arrow_batch_reader_single_shard_returns_native_reader_directly(monkeypatch: pytest.MonkeyPatch) -> None:
+    native = FakeShardReader([_batch([7])])
+
+    class FakeArrowReader:
+        def __init__(self, _file_io: Any, **_kwargs: Any) -> None:
+            pass
+
+        def read(self, _projection: Any, _tasks: list[Any]) -> FakeShardReader:
+            return native
+
+    monkeypatch.setattr(sys.modules["pyiceberg_core.scan"], "ArrowReader", FakeArrowReader)
+    monkeypatch.setenv("PYICEBERG_RUST_ARROW_SHARDS", "1")
+
+    # The fast path must hand back the native reader untouched, not wrap it in a fan-in.
+    reader = _build_reader(monkeypatch, n_tasks=4)
+    assert reader is native
+
+
+def _build_reader(monkeypatch: pytest.MonkeyPatch, n_tasks: int) -> Any:
+    """Drive ``arrow_batch_reader_from_pyiceberg_core`` with ``n_tasks`` trivial data-file tasks."""
+
+    def _identity_task_conversion(task: Any, *_args: Any, **_kwargs: Any) -> Any:
+        return task
+
+    # The conversion + projection helpers are covered by their own tests; stub them so this test
+    # focuses on the streaming fan-in rather than re-exercising payload conversion.
+    monkeypatch.setattr("pyiceberg.io.pyiceberg_core.file_scan_task_to_pyiceberg_core", _identity_task_conversion)
+    monkeypatch.setattr("pyiceberg.io.pyiceberg_core.schema_to_pyiceberg_core", lambda schema: schema)
+
+    schema = Schema(NestedField(1, "id", IntegerType(), required=True), schema_id=0)
+
+    tasks = []
+    for _ in range(n_tasks):
+        data_file = DataFile.from_args(
+            content=DataFileContent.DATA,
+            file_path="s3://warehouse/table/data.parquet",
+            file_format="PARQUET",
+            partition=Record(),
+            record_count=1,
+            file_size_in_bytes=1,
+            column_sizes={},
+            value_counts={},
+            null_value_counts={},
+            nan_value_counts={},
+            lower_bounds={},
+            upper_bounds={},
+        )
+        data_file.spec_id = 0
+        tasks.append(FileScanTask(data_file))
+
+    return arrow_batch_reader_from_pyiceberg_core(
+        FakeFileIO(properties={}),
+        tasks,
+        schema,
+        schema,
+        {0: PartitionSpec(spec_id=0)},
+        None,
+        True,
+    )
