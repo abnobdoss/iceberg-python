@@ -28,6 +28,7 @@ import pytest
 from pyiceberg.expressions import And, EqualTo, IsNull, StartsWith
 from pyiceberg.io import FileIO, InputFile, OutputFile
 from pyiceberg.io.pyiceberg_core import (
+    _cast_batches,
     _limited_batches,
     _ShardedBatchStream,
     arrow_batch_reader_from_pyiceberg_core,
@@ -354,6 +355,13 @@ class FakeShardReader:
         self._pos += 1
         return batch
 
+    # A real pyarrow.RecordBatchReader (what the single-shard fast path drains) is also iterable.
+    def __iter__(self) -> FakeShardReader:
+        return self
+
+    def __next__(self) -> pa.RecordBatch:
+        return self.read_next_batch()
+
 
 def _drain(reader: pa.RecordBatchReader) -> tuple[int, int]:
     """Return (row_count, sum-of-id checksum) — the same parity signal used in the perf gate."""
@@ -514,7 +522,9 @@ def test_sharded_batch_stream_shuts_down_on_garbage_collection() -> None:
     assert pool._shutdown  # the finalizer tore the pool down
 
 
-def test_arrow_batch_reader_single_shard_returns_native_reader_directly(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_arrow_batch_reader_single_shard_casts_to_target_schema(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The native reader hands back int64; the projected schema is IntegerType, so even the
+    # single-shard fast path must cast its output to the PyArrow target schema (here int32).
     native = FakeShardReader([_batch([7])])
 
     class FakeArrowReader:
@@ -527,9 +537,42 @@ def test_arrow_batch_reader_single_shard_returns_native_reader_directly(monkeypa
     monkeypatch.setattr(sys.modules["pyiceberg_core.scan"], "ArrowReader", FakeArrowReader)
     monkeypatch.setenv("PYICEBERG_RUST_ARROW_SHARDS", "1")
 
-    # The fast path must hand back the native reader untouched, not wrap it in a fan-in.
     reader = _build_reader(monkeypatch, n_tasks=4)
-    assert reader is native
+    table = reader.read_all()
+
+    assert table.column("id").to_pylist() == [7]
+    assert table.schema.field("id").type == pa.int32()  # cast to the projected schema's type, not the native int64
+
+
+def test_cast_batches_decodes_ree_and_matches_target_schema() -> None:
+    import pyarrow.compute as pc
+
+    ree = pc.run_end_encode(pa.array(["a", "a", "b"], pa.string()))
+    batch = pa.record_batch({"id": pa.array([1, 2, 3], pa.int64()), "cat": ree})
+    target = pa.schema([("id", pa.int32()), ("cat", pa.large_string())])
+
+    class Source:
+        def __init__(self, batches: list[pa.RecordBatch]) -> None:
+            self._it = iter(batches)
+            self.closed = False
+
+        def __iter__(self) -> Source:
+            return self
+
+        def __next__(self) -> pa.RecordBatch:
+            return next(self._it)
+
+        def close(self) -> None:
+            self.closed = True
+
+    source = Source([batch])
+    out = list(_cast_batches(source, target))
+
+    assert len(out) == 1
+    assert out[0].schema.field("id").type == pa.int32()  # native int64 widened/narrowed to the target
+    assert out[0].schema.field("cat").type == pa.large_string()  # run-end-encoded column decoded then cast
+    assert out[0].column("cat").to_pylist() == ["a", "a", "b"]
+    assert source.closed
 
 
 def test_limited_batches_truncates_to_limit_and_closes_source() -> None:

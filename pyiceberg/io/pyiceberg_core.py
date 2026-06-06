@@ -433,6 +433,34 @@ class _ShardedBatchStream:
         readers.clear()
 
 
+def _cast_batches(source: Any, target_schema: Any) -> Iterator[Any]:
+    """Cast every batch to the PyArrow path's output schema so the native path is a faithful drop-in.
+
+    The native reader returns arrow-rs's own types (e.g. ``string`` rather than PyIceberg's
+    ``large_string``) and run-end-encodes constant identity-partition columns. There is no direct
+    cast kernel from run-end-encoded to the target type, so those columns are decoded first, then a
+    single ``RecordBatch.cast`` aligns the whole batch with ``schema_to_pyarrow(projected_schema)``.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    try:
+        for batch in source:
+            columns = None
+            for i, column in enumerate(batch.columns):
+                if pa.types.is_run_end_encoded(column.type):
+                    if columns is None:
+                        columns = list(batch.columns)
+                    columns[i] = pc.run_end_decode(column)
+            if columns is not None:
+                batch = pa.RecordBatch.from_arrays(columns, names=batch.schema.names)
+            yield batch.cast(target_schema)
+    finally:
+        close = getattr(source, "close", None)
+        if close is not None:
+            close()
+
+
 def _limited_batches(source: Any, limit: int) -> Iterator[Any]:
     """Yield batches from ``source`` until ``limit`` rows have been emitted, then stop.
 
@@ -503,18 +531,19 @@ def arrow_batch_reader_from_pyiceberg_core(
 
     import pyarrow as pa
 
+    from pyiceberg.io.pyarrow import schema_to_pyarrow
+
+    # The PyArrow scan path returns this exact schema; casting the native batches to it makes the
+    # native path a faithful drop-in (matching large_string, decoded partition columns, etc.).
+    target_schema = schema_to_pyarrow(projected_schema)
+
     shards = _shard_count(len(core_tasks))
     if shards <= 1 or len(core_tasks) <= 1:
-        reader = _read(core_tasks)
-        if limit is None:
-            return reader
-        return pa.RecordBatchReader.from_batches(reader.schema, _limited_batches(reader, limit))
+        source: Any = _read(core_tasks)
+    else:
+        groups = [g for g in (core_tasks[i::shards] for i in range(shards)) if g]
+        source = _ShardedBatchStream([_read(group) for group in groups])
 
-    groups = [g for g in (core_tasks[i::shards] for i in range(shards)) if g]
-    readers = [_read(group) for group in groups]
-    # Every native reader carries the same projected Arrow schema; use it to type the stream.
-    arrow_schema = readers[0].schema
-    stream: Any = _ShardedBatchStream(readers)
     if limit is not None:
-        stream = _limited_batches(stream, limit)
-    return pa.RecordBatchReader.from_batches(arrow_schema, stream)
+        source = _limited_batches(source, limit)
+    return pa.RecordBatchReader.from_batches(target_schema, _cast_batches(source, target_schema))
