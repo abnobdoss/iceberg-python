@@ -458,6 +458,18 @@ def test_truncate_integer(type_var: PrimitiveType, input_var: int, expected: int
 
 
 @pytest.mark.parametrize(
+    "type_var,value",
+    [
+        (IntegerType(), IntegerType.min),
+        (LongType(), LongType.min),
+    ],
+)
+def test_truncate_integer_min_value_stays_in_type_range(type_var: PrimitiveType, value: int) -> None:
+    result = TruncateTransform(10).transform(type_var)(value)  # type: ignore
+    assert result == value
+
+
+@pytest.mark.parametrize(
     "input_var,expected",
     [
         (Decimal("12.34"), Decimal("12.30")),

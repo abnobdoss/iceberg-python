@@ -863,9 +863,10 @@ class TruncateTransform(Transform[S, S]):
 
     def transform(self, source: IcebergType) -> Callable[[S | None], S | None]:
         if isinstance(source, (IntegerType, LongType)):
+            min_value = source.min
 
             def truncate_func(v: Any) -> Any:
-                return v - v % self._width
+                return max(v - v % self._width, min_value)
 
         elif isinstance(source, (StringType, BinaryType)):
 
