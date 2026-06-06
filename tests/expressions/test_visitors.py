@@ -1611,22 +1611,34 @@ def test_dnf_to_dask(table_schema_simple: Schema) -> None:
 
 
 def test_expression_evaluator_null() -> None:
-    struct = Record(None)
-    schema = Schema(NestedField(1, "a", IntegerType(), required=False), schema_id=1)
+    struct = Record(None, None)
+    schema = Schema(
+        NestedField(1, "a", IntegerType(), required=False),
+        NestedField(2, "b", StringType(), required=False),
+        schema_id=1,
+    )
     assert expression_evaluator(schema, In("a", {1, 2, 3}), case_sensitive=True)(struct) is False
-    assert expression_evaluator(schema, NotIn("a", {1, 2, 3}), case_sensitive=True)(struct) is True
+    assert expression_evaluator(schema, NotIn("a", {1, 2, 3}), case_sensitive=True)(struct) is False
     assert expression_evaluator(schema, IsNaN("a"), case_sensitive=True)(struct) is False
     assert expression_evaluator(schema, NotNaN("a"), case_sensitive=True)(struct) is True
     assert expression_evaluator(schema, IsNull("a"), case_sensitive=True)(struct) is True
     assert expression_evaluator(schema, NotNull("a"), case_sensitive=True)(struct) is False
     assert expression_evaluator(schema, EqualTo("a", 1), case_sensitive=True)(struct) is False
-    assert expression_evaluator(schema, NotEqualTo("a", 1), case_sensitive=True)(struct) is True
+    assert expression_evaluator(schema, NotEqualTo("a", 1), case_sensitive=True)(struct) is False
     assert expression_evaluator(schema, GreaterThanOrEqual("a", 1), case_sensitive=True)(struct) is False
     assert expression_evaluator(schema, GreaterThan("a", 1), case_sensitive=True)(struct) is False
     assert expression_evaluator(schema, LessThanOrEqual("a", 1), case_sensitive=True)(struct) is False
     assert expression_evaluator(schema, LessThan("a", 1), case_sensitive=True)(struct) is False
-    assert expression_evaluator(schema, StartsWith("a", 1), case_sensitive=True)(struct) is False
-    assert expression_evaluator(schema, NotStartsWith("a", 1), case_sensitive=True)(struct) is True
+    assert expression_evaluator(schema, StartsWith("b", "a"), case_sensitive=True)(struct) is False
+    assert expression_evaluator(schema, NotStartsWith("b", "a"), case_sensitive=True)(struct) is False
+
+    struct = Record(0, "")
+    assert expression_evaluator(schema, NotIn("a", {1, 2, 3}), case_sensitive=True)(struct) is True
+    assert expression_evaluator(schema, NotIn("a", {0, 1, 2}), case_sensitive=True)(struct) is False
+    assert expression_evaluator(schema, NotEqualTo("a", 1), case_sensitive=True)(struct) is True
+    assert expression_evaluator(schema, NotEqualTo("a", 0), case_sensitive=True)(struct) is False
+    assert expression_evaluator(schema, NotStartsWith("b", "a"), case_sensitive=True)(struct) is True
+    assert expression_evaluator(schema, NotStartsWith("b", ""), case_sensitive=True)(struct) is False
 
 
 def test_translate_column_names_simple_case(table_schema_simple: Schema) -> None:

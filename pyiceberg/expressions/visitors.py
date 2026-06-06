@@ -469,7 +469,8 @@ class _ExpressionEvaluator(BoundBooleanExpressionVisitor[bool]):
         return term.eval(self.struct) in literals
 
     def visit_not_in(self, term: BoundTerm, literals: set[L]) -> bool:
-        return term.eval(self.struct) not in literals
+        value = term.eval(self.struct)
+        return value is not None and value not in literals
 
     def visit_is_nan(self, term: BoundTerm) -> bool:
         val = term.eval(self.struct)
@@ -489,7 +490,8 @@ class _ExpressionEvaluator(BoundBooleanExpressionVisitor[bool]):
         return term.eval(self.struct) == literal.value
 
     def visit_not_equal(self, term: BoundTerm, literal: LiteralValue) -> bool:
-        return term.eval(self.struct) != literal.value
+        value = term.eval(self.struct)
+        return value is not None and value != literal.value
 
     def visit_greater_than_or_equal(self, term: BoundTerm, literal: LiteralValue) -> bool:
         value = term.eval(self.struct)
@@ -512,7 +514,8 @@ class _ExpressionEvaluator(BoundBooleanExpressionVisitor[bool]):
         return eval_res is not None and str(eval_res).startswith(str(literal.value))
 
     def visit_not_starts_with(self, term: BoundTerm, literal: LiteralValue) -> bool:
-        return not self.visit_starts_with(term, literal)
+        eval_res = term.eval(self.struct)
+        return eval_res is not None and not str(eval_res).startswith(str(literal.value))
 
     def visit_true(self) -> bool:
         return True
