@@ -484,17 +484,13 @@ def _limited_batches(source: Any, limit: int) -> Iterator[Any]:
             close()
 
 
-def arrow_batch_reader_from_pyiceberg_core(
+def _read_core_tasks(
     file_io: FileIO,
-    tasks: Iterable[FileScanTask],
-    schema: Schema,
+    core_tasks: list[Any],
     projected_schema: Schema,
-    partition_specs: dict[int, PartitionSpec],
-    name_mapping: NameMapping | None,
-    case_sensitive: bool = True,
-    limit: int | None = None,
+    limit: int | None,
 ) -> Any:
-    """Read PyIceberg scan tasks through pyiceberg-core's ArrowReader as a streaming reader.
+    """Stream pyiceberg-core file scan tasks through ArrowReader as a casted, limited reader.
 
     Multi-file scans are sharded across a thread pool (see ``_shard_count``) so decode uses
     multiple cores; a single native reader over all files would decode on one core. Each shard
@@ -506,19 +502,6 @@ def arrow_batch_reader_from_pyiceberg_core(
     Worker-thread exceptions propagate to the consumer, and the shard threads are shut down when
     the reader is exhausted, closed early, or garbage collected.
     """
-    core_tasks = [
-        file_scan_task_to_pyiceberg_core(
-            task,
-            schema,
-            projected_schema,
-            partition_spec=partition_specs.get(task.file.spec_id),
-            name_mapping=name_mapping,
-            case_sensitive=case_sensitive,
-            project_field_ids=list(projected_schema.field_ids),
-        )
-        for task in tasks
-    ]
-
     core_projection = schema_to_pyiceberg_core(projected_schema)
     reader_kwargs = _reader_kwargs()
     if limit is not None:
@@ -547,3 +530,78 @@ def arrow_batch_reader_from_pyiceberg_core(
     if limit is not None:
         source = _limited_batches(source, limit)
     return pa.RecordBatchReader.from_batches(target_schema, _cast_batches(source, target_schema))
+
+
+def arrow_batch_reader_from_pyiceberg_core(
+    file_io: FileIO,
+    tasks: Iterable[FileScanTask],
+    schema: Schema,
+    projected_schema: Schema,
+    partition_specs: dict[int, PartitionSpec],
+    name_mapping: NameMapping | None,
+    case_sensitive: bool = True,
+    limit: int | None = None,
+) -> Any:
+    """Read PyIceberg scan tasks through pyiceberg-core's ArrowReader as a streaming reader.
+
+    PyIceberg plans the files (Python-side manifest planning); each task is converted to a
+    pyiceberg-core file scan task and streamed through ``_read_core_tasks``.
+    """
+    core_tasks = [
+        file_scan_task_to_pyiceberg_core(
+            task,
+            schema,
+            projected_schema,
+            partition_spec=partition_specs.get(task.file.spec_id),
+            name_mapping=name_mapping,
+            case_sensitive=case_sensitive,
+            project_field_ids=list(projected_schema.field_ids),
+        )
+        for task in tasks
+    ]
+    return _read_core_tasks(file_io, core_tasks, projected_schema, limit)
+
+
+def plan_and_read_with_pyiceberg_core(
+    table_metadata: Any,
+    io: FileIO,
+    projected_schema: Schema,
+    row_filter: BooleanExpression,
+    table_identifier: tuple[str, ...] | None,
+    *,
+    case_sensitive: bool = True,
+    snapshot_id: int | None = None,
+    limit: int | None = None,
+) -> Any:
+    """Plan and read a scan entirely in pyiceberg-core, skipping PyIceberg's manifest planning.
+
+    pyiceberg-core's ``Table.plan_files`` produces the file scan tasks (data files, deletes,
+    partition data, residual predicate) directly from the table metadata, and those tasks are fed
+    straight into ``_read_core_tasks``. The native planner applies the residual during the read, so
+    a filter on a column that is not part of ``projected_schema`` is still honoured.
+
+    ``selected_fields`` must be the top-level projected field *names* (the native planner sets each
+    task's ``project_field_ids`` from them); only flat projections are expressible this way.
+    """
+    scan = _core_module("scan")
+    file_io = file_io_to_pyiceberg_core(io)
+
+    # The identifier only names the table rust-side (data-file paths are absolute, so it does not
+    # affect planning); rust rejects a <2-part identifier, so fall back to a safe 2-part name.
+    identifier = list(table_identifier) if table_identifier and len(table_identifier) >= 2 else ["_", "_"]
+
+    native_table = scan.Table.from_metadata_json(file_io, identifier, table_metadata.model_dump_json())
+
+    predicate = None
+    if not isinstance(row_filter, AlwaysTrue):
+        predicate = expression_to_pyiceberg_core(row_filter, table_metadata.schema(), case_sensitive)
+
+    tasks = list(
+        native_table.plan_files(
+            selected_fields=[field.name for field in projected_schema.fields],
+            predicate=predicate,
+            snapshot_id=snapshot_id,
+            case_sensitive=case_sensitive,
+        )
+    )
+    return _read_core_tasks(io, tasks, projected_schema, limit)

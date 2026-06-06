@@ -111,6 +111,7 @@ if TYPE_CHECKING:
 ALWAYS_TRUE = AlwaysTrue()
 DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE = "downcast-ns-timestamp-to-us-on-write"
 PYICEBERG_RUST_ARROW_SCAN = "PYICEBERG_RUST_ARROW_SCAN"
+PYICEBERG_RUST_SCAN_PLANNING = "PYICEBERG_RUST_SCAN_PLANNING"
 
 
 @dataclass()
@@ -2244,6 +2245,27 @@ class DataScan(TableScan):
         from pyiceberg.io.pyarrow import ArrowScan, schema_to_pyarrow
 
         projected_schema = self.projection()
+        if os.environ.get(PYICEBERG_RUST_SCAN_PLANNING, "").lower() in {"1", "true", "yes"}:
+            from pyiceberg.io.pyiceberg_core import plan_and_read_with_pyiceberg_core
+
+            try:
+                return plan_and_read_with_pyiceberg_core(
+                    self.table_metadata,
+                    self.io,
+                    projected_schema,
+                    self.row_filter,
+                    self.table_identifier,
+                    case_sensitive=self.case_sensitive,
+                    snapshot_id=self.snapshot_id,
+                    limit=self.limit,
+                )
+            except (ModuleNotFoundError, NotImplementedError, ValueError) as exc:
+                warnings.warn(
+                    f"Falling back to PyArrow scan because pyiceberg-core cannot handle this scan: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
         if os.environ.get(PYICEBERG_RUST_ARROW_SCAN, "").lower() in {"1", "true", "yes"}:
             from pyiceberg.io.pyiceberg_core import (
                 arrow_batch_reader_from_pyiceberg_core,

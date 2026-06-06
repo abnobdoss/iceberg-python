@@ -37,6 +37,7 @@ from pyiceberg.io.pyiceberg_core import (
     expression_to_pyiceberg_core,
     file_io_to_pyiceberg_core,
     file_scan_task_to_pyiceberg_core,
+    plan_and_read_with_pyiceberg_core,
     schema_to_pyiceberg_core,
 )
 from pyiceberg.manifest import DataFile, DataFileContent
@@ -86,6 +87,29 @@ class CorePredicate(CoreObject):
         return CorePredicate(op="not", child=self)
 
 
+class CoreScanTable(CoreObject):
+    """Fake ``pyiceberg_core.scan.Table`` that records planning args and emits planned tasks."""
+
+    last_from_metadata_json: dict[str, Any] = {}
+    last_plan_files: dict[str, Any] = {}
+
+    @classmethod
+    def from_metadata_json(cls, file_io: Any, identifier: Any, metadata_json: str, **kwargs: Any) -> CoreScanTable:
+        CoreScanTable.last_from_metadata_json = {
+            "file_io": file_io,
+            "identifier": identifier,
+            "metadata_json": metadata_json,
+            **kwargs,
+        }
+        return cls()
+
+    def plan_files(self, **kwargs: Any) -> list[CoreObject]:
+        CoreScanTable.last_plan_files = kwargs
+        # One planned task per selected field keeps the count deterministic and lets the read fake
+        # echo back exactly what planning produced.
+        return [CoreObject(planned=name) for name in kwargs["selected_fields"]]
+
+
 class CoreReference(CoreObject):
     def _predicate(self, op: str, *args: Any) -> CorePredicate:
         return CorePredicate(op=op, name=self.args[0], args=args)
@@ -128,6 +152,7 @@ def fake_pyiceberg_core(monkeypatch: pytest.MonkeyPatch) -> None:
     scan: Any = ModuleType("pyiceberg_core.scan")
     scan.DeleteFile = CoreObject
     scan.FileScanTask = CoreObject
+    scan.Table = CoreScanTable  # planning tests drive from_metadata_json + plan_files through this
     scan.ArrowReader = CoreObject  # streaming tests override this with a batch-producing fake
 
     monkeypatch.setitem(sys.modules, "pyiceberg_core", root)
@@ -664,3 +689,136 @@ def _build_reader(monkeypatch: pytest.MonkeyPatch, n_tasks: int, limit: int | No
         True,
         limit=limit,
     )
+
+
+# --- native scan planning -----------------------------------------------------
+
+
+class FakeTableMetadata:
+    """Minimal stand-in: native planning only needs the metadata JSON and the table schema."""
+
+    def __init__(self, schema: Schema) -> None:
+        self._schema = schema
+
+    def model_dump_json(self) -> str:
+        return '{"format-version": 2}'
+
+    def schema(self) -> Schema:
+        return self._schema
+
+
+def _planning_arrow_reader(monkeypatch: pytest.MonkeyPatch, captured: dict[str, Any]) -> None:
+    """Wire a fake ArrowReader that records the projection + planned tasks and emits one batch."""
+
+    class FakeArrowReader:
+        def __init__(self, _file_io: Any, **kwargs: Any) -> None:
+            captured["reader_kwargs"] = kwargs
+
+        def read(self, projection: Any, tasks: list[Any]) -> FakeShardReader:
+            captured["projection"] = projection
+            captured["tasks"] = tasks
+            return FakeShardReader([_batch([1, 2, 3])])
+
+    monkeypatch.setattr(sys.modules["pyiceberg_core.scan"], "ArrowReader", FakeArrowReader)
+    monkeypatch.setenv("PYICEBERG_RUST_ARROW_SHARDS", "1")
+
+
+def test_plan_and_read_passes_projection_and_filter_to_native_planner(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+    _planning_arrow_reader(monkeypatch, captured)
+
+    schema = Schema(
+        NestedField(1, "id", IntegerType(), required=True),
+        NestedField(2, "data", StringType()),
+        schema_id=0,
+    )
+    projected_schema = Schema(NestedField(1, "id", IntegerType(), required=True), schema_id=0)
+
+    reader = plan_and_read_with_pyiceberg_core(
+        FakeTableMetadata(schema),
+        FakeFileIO(properties={"s3.region": "us-east-1"}),
+        projected_schema,
+        EqualTo("id", 5),
+        ("ns", "t"),
+        case_sensitive=False,
+        snapshot_id=42,
+    )
+    table = reader.read_all()
+
+    # The metadata JSON and a >=2-part identifier are handed to from_metadata_json verbatim.
+    assert CoreScanTable.last_from_metadata_json["identifier"] == ["ns", "t"]
+    assert CoreScanTable.last_from_metadata_json["metadata_json"] == '{"format-version": 2}'
+    # plan_files receives the projection as field NAMES, the converted predicate, snapshot, sensitivity.
+    plan = CoreScanTable.last_plan_files
+    assert plan["selected_fields"] == ["id"]
+    assert plan["snapshot_id"] == 42
+    assert plan["case_sensitive"] is False
+    assert plan["predicate"].kwargs == {"op": "eq", "name": "id", "args": (5,)}
+    # The planned tasks (not python-built tasks) are what the reader consumes.
+    assert [task.kwargs["planned"] for task in captured["tasks"]] == ["id"]
+    # Output is cast to the projected schema's PyArrow type (IntegerType -> int32, not native int64).
+    assert table.schema.field("id").type == pa.int32()
+    assert table.column("id").to_pylist() == [1, 2, 3]
+
+
+def test_plan_and_read_skips_predicate_for_always_true_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pyiceberg.expressions import AlwaysTrue
+
+    captured: dict[str, Any] = {}
+    _planning_arrow_reader(monkeypatch, captured)
+
+    schema = Schema(NestedField(1, "id", IntegerType(), required=True), schema_id=0)
+
+    plan_and_read_with_pyiceberg_core(
+        FakeTableMetadata(schema),
+        FakeFileIO(properties={}),
+        schema,
+        AlwaysTrue(),
+        ("ns", "t"),
+    ).read_all()
+
+    # An unfiltered scan must not pass a predicate at all (rather than always_true()).
+    assert CoreScanTable.last_plan_files["predicate"] is None
+
+
+def test_plan_and_read_falls_back_to_safe_identifier_for_short_identifier(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pyiceberg.expressions import AlwaysTrue
+
+    captured: dict[str, Any] = {}
+    _planning_arrow_reader(monkeypatch, captured)
+
+    schema = Schema(NestedField(1, "id", IntegerType(), required=True), schema_id=0)
+
+    # A single-part (or None) identifier cannot name a table rust-side; a 2-part fallback is used.
+    plan_and_read_with_pyiceberg_core(
+        FakeTableMetadata(schema),
+        FakeFileIO(properties={}),
+        schema,
+        AlwaysTrue(),
+        ("only_one",),
+    ).read_all()
+
+    identifier = CoreScanTable.last_from_metadata_json["identifier"]
+    assert len(identifier) >= 2
+
+
+def test_plan_and_read_applies_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pyiceberg.expressions import AlwaysTrue
+
+    captured: dict[str, Any] = {}
+    _planning_arrow_reader(monkeypatch, captured)
+
+    schema = Schema(NestedField(1, "id", IntegerType(), required=True), schema_id=0)
+
+    reader = plan_and_read_with_pyiceberg_core(
+        FakeTableMetadata(schema),
+        FakeFileIO(properties={}),
+        schema,
+        AlwaysTrue(),
+        ("ns", "t"),
+        limit=2,
+    )
+    table = reader.read_all()
+
+    assert table.num_rows == 2  # the batch of 3 is truncated to the limit
+    assert captured["reader_kwargs"]["batch_size"] == 2  # batch size capped to the limit
