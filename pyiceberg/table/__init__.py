@@ -23,6 +23,7 @@ import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
+from enum import Enum
 from functools import cached_property
 from itertools import chain
 from types import TracebackType
@@ -82,6 +83,7 @@ from pyiceberg.table.update.statistics import UpdateStatistics
 from pyiceberg.transforms import IdentityTransform
 from pyiceberg.typedef import (
     EMPTY_DICT,
+    ArrowStreamExportable,
     IcebergBaseModel,
     IcebergRootModel,
     Identifier,
@@ -107,9 +109,97 @@ if TYPE_CHECKING:
 
     from pyiceberg.catalog import Catalog
     from pyiceberg.catalog.rest.scan_planning import RESTContentFile, RESTDeleteFile, RESTFileScanTask
+    from pyiceberg.table.scan_planning import ScanPlanner
 
 ALWAYS_TRUE = AlwaysTrue()
 DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE = "downcast-ns-timestamp-to-us-on-write"
+PYICEBERG_RUST_ARROW_SCAN = "PYICEBERG_RUST_ARROW_SCAN"
+PYICEBERG_RUST_SCAN_PLANNING = "PYICEBERG_RUST_SCAN_PLANNING"
+PYICEBERG_RUST_SCAN_MODE = "PYICEBERG_RUST_SCAN_MODE"
+PYICEBERG_RUST_UPSERT_PREDICATE = "PYICEBERG_RUST_UPSERT_PREDICATE"
+
+
+class _ScanBackend(str, Enum):
+    PYARROW = "pyarrow"
+    RUST_READ = "rust-read"
+    RUST_PLAN_AND_READ = "rust-plan-and-read"
+
+
+def _env_flag_enabled(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"1", "true", "yes"}
+
+
+def _scan_backend_from_mode(mode: str) -> _ScanBackend | None:
+    try:
+        return _ScanBackend(mode.strip().lower())
+    except ValueError:
+        warnings.warn(
+            f"Ignoring unknown PyIceberg scan backend mode {mode!r}; using PyArrow.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
+
+
+def _scan_backend_candidates(properties: Properties) -> tuple[_ScanBackend, ...]:
+    mode = os.environ.get(PYICEBERG_RUST_SCAN_MODE)
+    if mode:
+        backend = _scan_backend_from_mode(mode)
+        return (backend, _ScanBackend.PYARROW) if backend and backend is not _ScanBackend.PYARROW else (_ScanBackend.PYARROW,)
+
+    candidates: list[_ScanBackend] = []
+    if _env_flag_enabled(PYICEBERG_RUST_SCAN_PLANNING):
+        candidates.append(_ScanBackend.RUST_PLAN_AND_READ)
+    if _env_flag_enabled(PYICEBERG_RUST_ARROW_SCAN):
+        candidates.append(_ScanBackend.RUST_READ)
+    if candidates:
+        candidates.append(_ScanBackend.PYARROW)
+        return tuple(candidates)
+
+    if mode := properties.get(TableProperties.PYICEBERG_CORE_SCAN_MODE):
+        backend = _scan_backend_from_mode(str(mode))
+        return (backend, _ScanBackend.PYARROW) if backend and backend is not _ScanBackend.PYARROW else (_ScanBackend.PYARROW,)
+
+    return (_ScanBackend.PYARROW,)
+
+
+def _scan_uses_native_reader(properties: Properties) -> bool:
+    return any(candidate is not _ScanBackend.PYARROW for candidate in _scan_backend_candidates(properties))
+
+
+def _native_upsert_predicate_enabled(properties: Properties) -> bool:
+    return _env_flag_enabled(PYICEBERG_RUST_UPSERT_PREDICATE) or property_as_bool(
+        properties, TableProperties.PYICEBERG_CORE_UPSERT_MATCH_FILTER_ENABLED, False
+    )
+
+
+def _native_scan_supports_paths(tasks: Iterable[FileScanTask]) -> bool:
+    """Return whether every planned data file has a URL scheme the native opendal reader can open.
+
+    The opendal-backed reader crashes on a bare local path (no ``scheme://``); the PyArrow path
+    reads those fine. Checking the planned task paths up front lets an unschemed path fall back to
+    PyArrow cleanly instead of crashing inside the native reader.
+    """
+    return all("://" in task.file.file_path for task in tasks)
+
+
+def _prime_native_reader(reader: pa.RecordBatchReader) -> pa.RecordBatchReader:
+    """Pull the first batch so a native decode failure surfaces before any batch is handed out.
+
+    The native reader builds eagerly but decodes lazily, so a binding mismatch can raise either at
+    construction or while the FIRST batch is decoded (e.g. the run-end-decode/cast in
+    pyiceberg_core). Forcing the first batch here lets the caller's guard fall back to PyArrow. The
+    primed batch is re-chained ahead of the rest, so iteration is unchanged. Once a batch has been
+    yielded a later error MUST propagate -- restarting on PyArrow would re-emit already returned rows
+    (silent duplication), so this only ever fronts the very first batch.
+    """
+    import pyarrow as pa
+
+    try:
+        first = reader.read_next_batch()
+    except StopIteration:
+        return reader
+    return pa.RecordBatchReader.from_batches(reader.schema, itertools.chain((first,), reader))
 
 
 @dataclass()
@@ -179,6 +269,9 @@ class TableProperties:
     DELETE_MODE_COPY_ON_WRITE = "copy-on-write"
     DELETE_MODE_MERGE_ON_READ = "merge-on-read"
     DELETE_MODE_DEFAULT = DELETE_MODE_COPY_ON_WRITE
+
+    PYICEBERG_CORE_SCAN_MODE = "read.pyiceberg-core.scan-mode"
+    PYICEBERG_CORE_UPSERT_MATCH_FILTER_ENABLED = "write.pyiceberg-core.upsert-match-filter.enabled"
 
     DEFAULT_NAME_MAPPING = "schema.name-mapping.default"
     FORMAT_VERSION = "format-version"
@@ -452,7 +545,7 @@ class Transaction:
 
     def append(
         self,
-        df: pa.Table | pa.RecordBatchReader,
+        df: pa.Table | pa.RecordBatchReader | ArrowStreamExportable,
         snapshot_properties: dict[str, str] = EMPTY_DICT,
         branch: str | None = MAIN_BRANCH,
     ) -> None:
@@ -505,10 +598,9 @@ class Transaction:
         except ModuleNotFoundError as e:
             raise ModuleNotFoundError("For writes PyArrow needs to be installed") from e
 
-        from pyiceberg.io.pyarrow import _check_pyarrow_schema_compatible, _dataframe_to_data_files
+        from pyiceberg.io.pyarrow import _check_pyarrow_schema_compatible, _coerce_arrow_input, _dataframe_to_data_files
 
-        if not isinstance(df, (pa.Table, pa.RecordBatchReader)):
-            raise ValueError(f"Expected pa.Table or pa.RecordBatchReader, got: {df}")
+        df = _coerce_arrow_input(df)
 
         downcast_ns_timestamp_to_us = Config().get_bool(DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE) or False
         _check_pyarrow_schema_compatible(
@@ -598,7 +690,7 @@ class Transaction:
 
     def overwrite(
         self,
-        df: pa.Table | pa.RecordBatchReader,
+        df: pa.Table | pa.RecordBatchReader | ArrowStreamExportable,
         overwrite_filter: BooleanExpression | str = ALWAYS_TRUE,
         snapshot_properties: dict[str, str] = EMPTY_DICT,
         case_sensitive: bool = True,
@@ -662,10 +754,9 @@ class Transaction:
         except ModuleNotFoundError as e:
             raise ModuleNotFoundError("For writes PyArrow needs to be installed") from e
 
-        from pyiceberg.io.pyarrow import _check_pyarrow_schema_compatible, _dataframe_to_data_files
+        from pyiceberg.io.pyarrow import _check_pyarrow_schema_compatible, _coerce_arrow_input, _dataframe_to_data_files
 
-        if not isinstance(df, (pa.Table, pa.RecordBatchReader)):
-            raise ValueError(f"Expected pa.Table or pa.RecordBatchReader, got: {df}")
+        df = _coerce_arrow_input(df)
 
         downcast_ns_timestamp_to_us = Config().get_bool(DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE) or False
         _check_pyarrow_schema_compatible(
@@ -874,22 +965,49 @@ class Transaction:
             format_version=self.table_metadata.format_version,
         )
 
-        # get list of rows that exist so we don't have to load the entire target table
-        matched_predicate = upsert_util.create_match_filter(df, join_cols)
+        matched_iceberg_record_batches = None
+        if _native_upsert_predicate_enabled(self.table_metadata.properties):
+            try:
+                from pyiceberg.io.pyiceberg_core import match_filter_to_pyiceberg_core, plan_and_read_with_pyiceberg_core
 
-        # We must use Transaction.table_metadata for the scan. This includes all uncommitted - but relevant - changes.
+                snapshot_id = None
+                if branch in self.table_metadata.refs:
+                    snapshot_id = self.table_metadata.refs[branch].snapshot_id
 
-        matched_iceberg_record_batches_scan = DataScan(
-            table_metadata=self.table_metadata,
-            io=self._table.io,
-            row_filter=matched_predicate,
-            case_sensitive=case_sensitive,
-        )
+                matched_iceberg_record_batches = plan_and_read_with_pyiceberg_core(
+                    self.table_metadata,
+                    self._table.io,
+                    self.table_metadata.schema(),
+                    ALWAYS_TRUE,
+                    self._table.name(),
+                    case_sensitive=case_sensitive,
+                    snapshot_id=snapshot_id,
+                    native_predicate=match_filter_to_pyiceberg_core(df, join_cols),
+                )
+            except (ModuleNotFoundError, NotImplementedError, ValueError, TypeError, pa.lib.ArrowInvalid) as exc:
+                warnings.warn(
+                    f"Falling back to PyIceberg upsert match filtering because pyiceberg-core cannot handle it: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
-        if branch in self.table_metadata.refs:
-            matched_iceberg_record_batches_scan = matched_iceberg_record_batches_scan.use_ref(branch)
+        if matched_iceberg_record_batches is None:
+            # get list of rows that exist so we don't have to load the entire target table
+            matched_predicate = upsert_util.create_match_filter(df, join_cols)
 
-        matched_iceberg_record_batches = matched_iceberg_record_batches_scan.to_arrow_batch_reader()
+            # We must use Transaction.table_metadata for the scan. This includes all uncommitted - but relevant - changes.
+
+            matched_iceberg_record_batches_scan = DataScan(
+                table_metadata=self.table_metadata,
+                io=self._table.io,
+                row_filter=matched_predicate,
+                case_sensitive=case_sensitive,
+            )
+
+            if branch in self.table_metadata.refs:
+                matched_iceberg_record_batches_scan = matched_iceberg_record_batches_scan.use_ref(branch)
+
+            matched_iceberg_record_batches = matched_iceberg_record_batches_scan.to_arrow_batch_reader()
 
         batches_to_overwrite = []
         overwrite_predicates = []
@@ -1472,7 +1590,7 @@ class Table:
 
     def append(
         self,
-        df: pa.Table | pa.RecordBatchReader,
+        df: pa.Table | pa.RecordBatchReader | ArrowStreamExportable,
         snapshot_properties: dict[str, str] = EMPTY_DICT,
         branch: str | None = MAIN_BRANCH,
     ) -> None:
@@ -1507,7 +1625,7 @@ class Table:
 
     def overwrite(
         self,
-        df: pa.Table | pa.RecordBatchReader,
+        df: pa.Table | pa.RecordBatchReader | ArrowStreamExportable,
         overwrite_filter: BooleanExpression | str = ALWAYS_TRUE,
         snapshot_properties: dict[str, str] = EMPTY_DICT,
         case_sensitive: bool = True,
@@ -1716,6 +1834,10 @@ class Table:
         ).__datafusion_table_provider__
         return provider(session)
 
+    def __arrow_c_stream__(self, requested_schema: object | None = None) -> object:
+        """Export this table as an Arrow C stream."""
+        return self.scan().to_arrow_batch_reader().__arrow_c_stream__(requested_schema)
+
 
 class StaticTable(Table):
     """Load a table directly from a metadata file (i.e., without using a catalog)."""
@@ -1809,6 +1931,7 @@ class TableScan(ABC):
     limit: int | None
     catalog: Catalog | None
     table_identifier: Identifier | None
+    scan_planner: ScanPlanner | None
 
     def __init__(
         self,
@@ -1822,6 +1945,7 @@ class TableScan(ABC):
         limit: int | None = None,
         catalog: Catalog | None = None,
         table_identifier: Identifier | None = None,
+        scan_planner: ScanPlanner | None = None,
     ):
         self.table_metadata = table_metadata
         self.io = io
@@ -1833,6 +1957,7 @@ class TableScan(ABC):
         self.limit = limit
         self.catalog = catalog
         self.table_identifier = table_identifier
+        self.scan_planner = scan_planner
 
     def snapshot(self) -> Snapshot | None:
         if self.snapshot_id:
@@ -2202,16 +2327,17 @@ class DataScan(TableScan):
     def plan_files(self) -> Iterable[FileScanTask]:
         """Plans the relevant files by filtering on the PartitionSpecs.
 
-        If the table comes from a REST catalog with scan planning enabled,
-        this will use server-side scan planning. Otherwise, it falls back
-        to local planning.
+        The planning strategy is pluggable: an injected ``scan_planner`` is used if set, otherwise
+        a planner is resolved per scan. The default resolution uses REST server-side planning when
+        the catalog supports it and local manifest planning otherwise.
 
         Returns:
             List of FileScanTasks that contain both data and delete files.
         """
-        if self._should_use_server_side_planning():
-            return self._plan_files_server_side()
-        return self._plan_files_local()
+        from pyiceberg.table.scan_planning import resolve_scan_planner
+
+        planner = self.scan_planner or resolve_scan_planner(self)
+        return planner.plan_files(self)
 
     def to_arrow(self) -> pa.Table:
         """Read an Arrow table eagerly from this DataScan.
@@ -2221,6 +2347,9 @@ class DataScan(TableScan):
         Returns:
             pa.Table: Materialized Arrow Table from the Iceberg table's DataScan
         """
+        if _scan_uses_native_reader(self.table_metadata.properties):
+            return self.to_arrow_batch_reader().read_all()
+
         from pyiceberg.io.pyarrow import ArrowScan
 
         return ArrowScan(
@@ -2242,15 +2371,97 @@ class DataScan(TableScan):
 
         from pyiceberg.io.pyarrow import ArrowScan, schema_to_pyarrow
 
-        target_schema = schema_to_pyarrow(self.projection())
+        projected_schema = self.projection()
+
+        # An unsupported native scan should DEGRADE to PyArrow, not crash. The native reader builds
+        # eagerly but decodes lazily, so a binding mismatch can surface either at construction or
+        # while the FIRST batch is decoded (e.g. the run-end-decode/cast in pyiceberg_core). We prime
+        # that first batch under the guard and re-chain it; once any batch has been handed to the
+        # caller we MUST let later errors propagate -- restarting on PyArrow would re-emit already
+        # yielded rows (silent duplication). The catch is scoped to the native attempt only: the
+        # binding raises ValueError/NotImplementedError for unsupported scans and TypeError/
+        # ArrowInvalid for prop/decode mismatches; broader user errors still surface.
+        native_fallback_errors = (ModuleNotFoundError, NotImplementedError, ValueError, TypeError, pa.lib.ArrowInvalid)
+
+        for backend in _scan_backend_candidates(self.table_metadata.properties):
+            if backend is _ScanBackend.PYARROW:
+                break
+
+            if backend is _ScanBackend.RUST_PLAN_AND_READ:
+                from pyiceberg.io.pyiceberg_core import plan_and_read_with_pyiceberg_core
+
+                try:
+                    return _prime_native_reader(
+                        plan_and_read_with_pyiceberg_core(
+                            self.table_metadata,
+                            self.io,
+                            projected_schema,
+                            self.row_filter,
+                            self.table_identifier,
+                            case_sensitive=self.case_sensitive,
+                            snapshot_id=self.snapshot_id,
+                            limit=self.limit,
+                        )
+                    )
+                except native_fallback_errors as exc:
+                    warnings.warn(
+                        f"Falling back to PyArrow scan because pyiceberg-core cannot handle this scan: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+
+            if backend is _ScanBackend.RUST_READ:
+                from pyiceberg.io.pyiceberg_core import (
+                    arrow_batch_reader_from_pyiceberg_core,
+                    can_read_projected_schema_with_pyiceberg_core,
+                )
+
+                if can_read_projected_schema_with_pyiceberg_core(
+                    self.table_metadata.schema(), projected_schema, self.row_filter, self.case_sensitive
+                ):
+                    # Plan once and reuse: the bare-path guard inspects the same tasks the reader gets.
+                    native_tasks = list(self.plan_files())
+                    if not _native_scan_supports_paths(native_tasks):
+                        warnings.warn(
+                            "Falling back to PyArrow scan because pyiceberg-core cannot read a data file path "
+                            "without a URL scheme.",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                    else:
+                        try:
+                            return _prime_native_reader(
+                                arrow_batch_reader_from_pyiceberg_core(
+                                    self.io,
+                                    native_tasks,
+                                    self.table_metadata.schema(),
+                                    projected_schema,
+                                    self.table_metadata.specs(),
+                                    self.table_metadata.name_mapping(),
+                                    self.case_sensitive,
+                                    limit=self.limit,
+                                )
+                            )
+                        except native_fallback_errors as exc:
+                            warnings.warn(
+                                f"Falling back to PyArrow scan because pyiceberg-core cannot handle this scan: {exc}",
+                                RuntimeWarning,
+                                stacklevel=2,
+                            )
+
+        target_schema = schema_to_pyarrow(projected_schema)
         batches = ArrowScan(
-            self.table_metadata, self.io, self.projection(), self.row_filter, self.case_sensitive, self.limit
+            self.table_metadata, self.io, projected_schema, self.row_filter, self.case_sensitive, self.limit
         ).to_record_batches(self.plan_files())
 
         return pa.RecordBatchReader.from_batches(
             target_schema,
             batches,
         ).cast(target_schema)
+
+    def __arrow_c_stream__(self, requested_schema: object | None = None) -> object:
+        """Export this scan as an Arrow C stream."""
+        return self.to_arrow_batch_reader().__arrow_c_stream__(requested_schema)
 
     def to_pandas(self, **kwargs: Any) -> pd.DataFrame:
         """Read a Pandas DataFrame eagerly from this Iceberg table.
@@ -2269,7 +2480,10 @@ class DataScan(TableScan):
         import duckdb
 
         con = connection or duckdb.connect(database=":memory:")
-        con.register(table_name, self.to_arrow())
+        try:
+            con.register(table_name, self.to_arrow_batch_reader())
+        except TypeError:
+            con.register(table_name, self.to_arrow())
 
         return con
 
@@ -2291,7 +2505,10 @@ class DataScan(TableScan):
         """
         import polars as pl
 
-        result = pl.from_arrow(self.to_arrow())
+        try:
+            result = pl.DataFrame(self)
+        except (TypeError, ValueError):
+            result = pl.from_arrow(self.to_arrow_batch_reader())
         if isinstance(result, pl.Series):
             result = result.to_frame()
 
