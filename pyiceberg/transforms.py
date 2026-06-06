@@ -22,6 +22,7 @@ import struct
 import types
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from decimal import Decimal
 from enum import IntEnum
 from functools import singledispatch
 from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar
@@ -262,10 +263,25 @@ class BucketTransform(Transform[S, int]):
         return self._num_buckets
 
     def hash(self, value: S) -> int:
-        raise NotImplementedError()
+        if isinstance(value, py_datetime.datetime):
+            return mmh3.hash(struct.pack("<q", datetime.datetime_to_micros(value)))
+        elif isinstance(value, py_datetime.date):
+            return mmh3.hash(struct.pack("<q", datetime.date_to_days(value)))
+        elif isinstance(value, py_datetime.time):
+            return mmh3.hash(struct.pack("<q", datetime.time_to_micros(value)))
+        elif isinstance(value, int):
+            return mmh3.hash(struct.pack("<q", value))
+        elif isinstance(value, Decimal):
+            return mmh3.hash(decimal_to_bytes(value))
+        elif isinstance(value, UUID):
+            return mmh3.hash(value.bytes)
+        elif isinstance(value, (str, bytes)):
+            return mmh3.hash(value)
+        else:
+            raise ValueError(f"Unknown type {type(value)}")
 
     def apply(self, value: S | None) -> int | None:
-        return (self.hash(value) & IntegerType.max) % self._num_buckets if value else None
+        return (self.hash(value) & IntegerType.max) % self._num_buckets if value is not None else None
 
     def result_type(self, source: IcebergType) -> IcebergType:
         return IntegerType()

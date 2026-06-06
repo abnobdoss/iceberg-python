@@ -230,6 +230,13 @@ def test_bucket_method(type_var: PrimitiveType) -> None:
     assert bucket_transform.to_human_string(type_var, "test") == "test"
 
 
+@pytest.mark.parametrize("value", [0, 42, "", b""])
+def test_bucket_apply_handles_falsy_values(value: Any) -> None:
+    result = BucketTransform(8).apply(value)  # type: ignore
+    assert result is not None
+    assert 0 <= result < 8
+
+
 @pytest.mark.parametrize(
     "test_transform",
     [
