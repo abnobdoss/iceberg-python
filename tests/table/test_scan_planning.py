@@ -22,7 +22,7 @@ from typing import Any
 import pyarrow as pa
 import pytest
 
-from pyiceberg.table import Table
+from pyiceberg.table import PYICEBERG_RUST_SCAN_MODE, Table, TableProperties, _scan_backend_candidates
 from pyiceberg.table.scan_planning import (
     LocalScanPlanner,
     RestScanPlanner,
@@ -147,3 +147,36 @@ def test_data_scan_to_arrow_uses_native_batch_reader_when_requested(
 
     assert seen == [scan]
     assert table.column("id").to_pylist() == [1, 2]
+
+
+def test_scan_backend_candidates_preserve_legacy_env_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PYICEBERG_RUST_SCAN_PLANNING", "1")
+    monkeypatch.setenv("PYICEBERG_RUST_ARROW_SCAN", "1")
+
+    assert [candidate.value for candidate in _scan_backend_candidates({})] == [
+        "rust-plan-and-read",
+        "rust-read",
+        "pyarrow",
+    ]
+
+
+def test_scan_backend_candidates_use_env_mode_before_table_property(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(PYICEBERG_RUST_SCAN_MODE, "rust-read")
+
+    assert [
+        candidate.value
+        for candidate in _scan_backend_candidates({TableProperties.PYICEBERG_CORE_SCAN_MODE: "rust-plan-and-read"})
+    ] == [
+        "rust-read",
+        "pyarrow",
+    ]
+
+
+def test_scan_backend_candidates_use_table_property() -> None:
+    assert [
+        candidate.value
+        for candidate in _scan_backend_candidates({TableProperties.PYICEBERG_CORE_SCAN_MODE: "rust-plan-and-read"})
+    ] == [
+        "rust-plan-and-read",
+        "pyarrow",
+    ]

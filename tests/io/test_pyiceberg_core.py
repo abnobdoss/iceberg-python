@@ -273,7 +273,7 @@ def test_delete_file_to_pyiceberg_core_converts_delete_file_payload() -> None:
     assert converted.kwargs == {"partition_spec_id": 7, "equality_ids": None}
 
 
-def test_delete_file_to_pyiceberg_core_rejects_equality_deletes_until_parity_lands() -> None:
+def test_delete_file_to_pyiceberg_core_converts_equality_delete_payload() -> None:
     delete_file = DataFile.from_args(
         content=DataFileContent.EQUALITY_DELETES,
         file_path="s3://warehouse/table/eq-delete.parquet",
@@ -291,8 +291,10 @@ def test_delete_file_to_pyiceberg_core_rejects_equality_deletes_until_parity_lan
     )
     delete_file.spec_id = 7
 
-    with pytest.raises(NotImplementedError, match="equality delete scan parity"):
-        delete_file_to_pyiceberg_core(delete_file)
+    converted = delete_file_to_pyiceberg_core(delete_file)
+
+    assert converted.args == ("s3://warehouse/table/eq-delete.parquet", 123, "equality-deletes")
+    assert converted.kwargs == {"partition_spec_id": 7, "equality_ids": [1]}
 
 
 def test_file_scan_task_to_pyiceberg_core_converts_task_payload(simple_schema: Schema) -> None:

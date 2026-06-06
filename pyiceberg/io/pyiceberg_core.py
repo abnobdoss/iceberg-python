@@ -258,6 +258,23 @@ def expression_to_pyiceberg_core(
     raise NotImplementedError(f"Cannot convert unsupported PyIceberg expression {expr!r} to pyiceberg_core")
 
 
+def match_filter_to_pyiceberg_core(df: Any, join_cols: list[str]) -> Any:
+    """Build a native predicate matching the unique join keys in ``df``."""
+    expression = _core_module("expression")
+    unique_keys = df.select(join_cols).group_by(join_cols).aggregate([])
+
+    if len(join_cols) == 1:
+        return expression.Reference(join_cols[0]).is_in(unique_keys[0].to_pylist())
+
+    predicate = expression.Predicate.always_false()
+    for row in unique_keys.to_pylist():
+        row_predicate = expression.Predicate.always_true()
+        for col in join_cols:
+            row_predicate = row_predicate.and_(expression.Reference(col).eq(row[col]))
+        predicate = predicate.or_(row_predicate)
+    return predicate
+
+
 def _bound_predicate_to_pyiceberg_core(expr: BoundPredicate) -> Any:
     ref = _core_module("expression").Reference(_term_name(expr.term))
 
@@ -302,7 +319,7 @@ def delete_file_to_pyiceberg_core(delete_file: DataFile) -> Any:
     if content == 1:
         file_type = "position-deletes"
     elif content == 2:
-        raise NotImplementedError("pyiceberg-core equality delete scan parity is tracked separately")
+        file_type = "equality-deletes"
     else:
         raise ValueError(f"Expected a delete file, got data file content {delete_file.content!r}")
 
@@ -615,6 +632,7 @@ def plan_and_read_with_pyiceberg_core(
     case_sensitive: bool = True,
     snapshot_id: int | None = None,
     limit: int | None = None,
+    native_predicate: Any | None = None,
 ) -> Any:
     """Plan and read a scan entirely in pyiceberg-core, skipping PyIceberg's manifest planning.
 
@@ -635,8 +653,8 @@ def plan_and_read_with_pyiceberg_core(
 
     native_table = scan.Table.from_metadata_json(file_io, identifier, table_metadata.model_dump_json())
 
-    predicate = None
-    if not isinstance(row_filter, AlwaysTrue):
+    predicate = native_predicate
+    if predicate is None and not isinstance(row_filter, AlwaysTrue):
         predicate = expression_to_pyiceberg_core(row_filter, table_metadata.schema(), case_sensitive)
 
     tasks = list(

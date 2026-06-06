@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 from pathlib import PosixPath
+from typing import Any
 
 import pyarrow as pa
 import pytest
@@ -117,6 +118,39 @@ def gen_target_iceberg_table(
 def assert_upsert_result(res: UpsertResult, expected_updated: int, expected_inserted: int) -> None:
     assert res.rows_updated == expected_updated, f"rows updated should be {expected_updated}, but got {res.rows_updated}"
     assert res.rows_inserted == expected_inserted, f"rows inserted should be {expected_inserted}, but got {res.rows_inserted}"
+
+
+def test_upsert_can_use_native_match_filter(catalog: Catalog, monkeypatch: pytest.MonkeyPatch) -> None:
+    identifier = "default.test_upsert_native_match_filter"
+    schema = Schema(
+        NestedField(1, "id", IntegerType(), required=False),
+        NestedField(2, "data", StringType(), required=False),
+    )
+    table = catalog.create_table(identifier, schema=schema)
+    source = pa.table({"id": pa.array([1, 2], type=pa.int32()), "data": ["a", "b"]})
+    native_calls: list[tuple[Any, ...]] = []
+
+    def _native_filter(df: pa.Table, join_cols: list[str]) -> object:
+        native_calls.append(("predicate", df.num_rows, join_cols))
+        return object()
+
+    def _native_read(*args: object, **kwargs: object) -> pa.RecordBatchReader:
+        native_calls.append(("read", kwargs["native_predicate"]))
+        return pa.RecordBatchReader.from_batches(source.schema, [])
+
+    def _python_filter(*args: object, **kwargs: object) -> object:
+        raise AssertionError("Python match filter should not be built when native path succeeds")
+
+    monkeypatch.setenv("PYICEBERG_RUST_UPSERT_PREDICATE", "1")
+    monkeypatch.setattr("pyiceberg.io.pyiceberg_core.match_filter_to_pyiceberg_core", _native_filter)
+    monkeypatch.setattr("pyiceberg.io.pyiceberg_core.plan_and_read_with_pyiceberg_core", _native_read)
+    monkeypatch.setattr("pyiceberg.table.upsert_util.create_match_filter", _python_filter)
+
+    result = table.upsert(source, join_cols=["id"])
+
+    assert_upsert_result(result, expected_updated=0, expected_inserted=2)
+    assert native_calls[0] == ("predicate", 2, ["id"])
+    assert native_calls[1][0] == "read"
 
 
 @pytest.mark.parametrize(
