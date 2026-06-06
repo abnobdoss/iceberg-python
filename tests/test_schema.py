@@ -92,6 +92,10 @@ def test_schema_str(table_schema_simple: Schema) -> None:
     )
 
 
+def test_empty_schemas_are_equal() -> None:
+    assert Schema() == Schema()
+
+
 def test_schema_repr_single_field() -> None:
     """Test schema representation"""
     actual = repr(Schema(NestedField(field_id=1, name="foo", field_type=StringType()), schema_id=1))
