@@ -216,16 +216,20 @@ def test_validate_deleted_data_files_raises_on_conflict(
     newest_snapshot = cast(Snapshot, table.current_snapshot())
 
     class DummyEntry:
-        snapshot_id = 123
+        def __init__(self, snapshot_id: int) -> None:
+            self.snapshot_id = snapshot_id
 
-    with patch("pyiceberg.table.update.validate._deleted_data_files", return_value=[DummyEntry()]):
-        with pytest.raises(ValidationException):
+    with patch("pyiceberg.table.update.validate._deleted_data_files", return_value=iter([DummyEntry(123), DummyEntry(456)])):
+        with pytest.raises(ValidationException) as exc_info:
             _validate_deleted_data_files(
                 table=table,
                 starting_snapshot=newest_snapshot,
                 data_filter=None,
                 parent_snapshot=oldest_snapshot,
             )
+
+    assert "123" in str(exc_info.value)
+    assert "456" in str(exc_info.value)
 
 
 @pytest.mark.parametrize("operation", [Operation.APPEND, Operation.OVERWRITE])
@@ -343,16 +347,20 @@ def test_validate_added_data_files_raises_on_conflict(
     newest_snapshot = cast(Snapshot, table.current_snapshot())
 
     class DummyEntry:
-        snapshot_id = 123
+        def __init__(self, snapshot_id: int) -> None:
+            self.snapshot_id = snapshot_id
 
-    with patch("pyiceberg.table.update.validate._added_data_files", return_value=[DummyEntry()]):
-        with pytest.raises(ValidationException):
+    with patch("pyiceberg.table.update.validate._added_data_files", return_value=iter([DummyEntry(123), DummyEntry(456)])):
+        with pytest.raises(ValidationException) as exc_info:
             _validate_added_data_files(
                 table=table,
                 starting_snapshot=newest_snapshot,
                 data_filter=None,
                 parent_snapshot=oldest_snapshot,
             )
+
+    assert "123" in str(exc_info.value)
+    assert "456" in str(exc_info.value)
 
 
 @pytest.mark.parametrize("operation", [Operation.APPEND, Operation.REPLACE])
