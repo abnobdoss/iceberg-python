@@ -210,6 +210,18 @@ def test_creation_when_all_tables_exists(alchemy_engine: Engine, catalog_name: s
     confirm_all_tables_exist(catalog)
 
 
+def test_namespace_exists_after_removing_all_properties(catalog_memory: SqlCatalog) -> None:
+    namespace = ("properties_removed",)
+    catalog_memory.create_namespace(namespace, {"prop": "value"})
+    try:
+        catalog_memory.update_namespace_properties(namespace, removals={"prop"})
+
+        assert catalog_memory.namespace_exists(namespace)
+    finally:
+        if catalog_memory.namespace_exists(namespace):
+            catalog_memory.drop_namespace(namespace)
+
+
 class TestSqlCatalogClose:
     """Test SqlCatalog close functionality."""
 

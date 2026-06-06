@@ -740,6 +740,25 @@ class SqlCatalog(MetastoreCatalog):
                 ]
                 insert_stmt = insert(IcebergNamespaceProperties).values(insert_stmt_values)
                 session.execute(insert_stmt)
+            namespace_row = session.execute(
+                select(IcebergNamespaceProperties)
+                .where(
+                    IcebergNamespaceProperties.catalog_name == self.name,
+                    IcebergNamespaceProperties.namespace == namespace_str,
+                )
+                .limit(1)
+            ).first()
+            if namespace_row is None:
+                insert_stmt_values = [
+                    {
+                        IcebergNamespaceProperties.catalog_name: self.name,
+                        IcebergNamespaceProperties.namespace: namespace_str,
+                        IcebergNamespaceProperties.property_key: property_key,
+                        IcebergNamespaceProperties.property_value: property_value,
+                    }
+                    for property_key, property_value in IcebergNamespaceProperties.NAMESPACE_MINIMAL_PROPERTIES.items()
+                ]
+                session.execute(insert(IcebergNamespaceProperties).values(insert_stmt_values))
             session.commit()
         return properties_update_summary
 
