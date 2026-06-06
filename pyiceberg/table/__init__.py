@@ -107,6 +107,7 @@ if TYPE_CHECKING:
 
     from pyiceberg.catalog import Catalog
     from pyiceberg.catalog.rest.scan_planning import RESTContentFile, RESTDeleteFile, RESTFileScanTask
+    from pyiceberg.table.scan_planning import ScanPlanner
 
 ALWAYS_TRUE = AlwaysTrue()
 DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE = "downcast-ns-timestamp-to-us-on-write"
@@ -1840,6 +1841,7 @@ class TableScan(ABC):
     limit: int | None
     catalog: Catalog | None
     table_identifier: Identifier | None
+    scan_planner: ScanPlanner | None
 
     def __init__(
         self,
@@ -1853,6 +1855,7 @@ class TableScan(ABC):
         limit: int | None = None,
         catalog: Catalog | None = None,
         table_identifier: Identifier | None = None,
+        scan_planner: ScanPlanner | None = None,
     ):
         self.table_metadata = table_metadata
         self.io = io
@@ -1864,6 +1867,7 @@ class TableScan(ABC):
         self.limit = limit
         self.catalog = catalog
         self.table_identifier = table_identifier
+        self.scan_planner = scan_planner
 
     def snapshot(self) -> Snapshot | None:
         if self.snapshot_id:
@@ -2233,16 +2237,17 @@ class DataScan(TableScan):
     def plan_files(self) -> Iterable[FileScanTask]:
         """Plans the relevant files by filtering on the PartitionSpecs.
 
-        If the table comes from a REST catalog with scan planning enabled,
-        this will use server-side scan planning. Otherwise, it falls back
-        to local planning.
+        The planning strategy is pluggable: an injected ``scan_planner`` is used if set, otherwise
+        a planner is resolved per scan. The default resolution uses REST server-side planning when
+        the catalog supports it and local manifest planning otherwise.
 
         Returns:
             List of FileScanTasks that contain both data and delete files.
         """
-        if self._should_use_server_side_planning():
-            return self._plan_files_server_side()
-        return self._plan_files_local()
+        from pyiceberg.table.scan_planning import resolve_scan_planner
+
+        planner = self.scan_planner or resolve_scan_planner(self)
+        return planner.plan_files(self)
 
     def to_arrow(self) -> pa.Table:
         """Read an Arrow table eagerly from this DataScan.
