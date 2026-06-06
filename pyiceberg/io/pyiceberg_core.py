@@ -53,13 +53,19 @@ from pyiceberg.expressions import (
     UnaryPredicate,
     UnboundTerm,
 )
-from pyiceberg.io import FileIO
+from pyiceberg.io import (
+    AWS_REGION,
+    S3_FORCE_VIRTUAL_ADDRESSING,
+    S3_REGION,
+    FileIO,
+)
 from pyiceberg.manifest import DataFile
 from pyiceberg.partitioning import PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.table import FileScanTask
 from pyiceberg.table.name_mapping import NameMapping
 from pyiceberg.typedef import Record
+from pyiceberg.utils.properties import property_as_bool
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
@@ -89,9 +95,46 @@ def schema_to_pyiceberg_core(schema: Schema) -> Any:
     return _core_module("schema").Schema.from_json(_model_json(schema))
 
 
+def _string_props(properties: dict[str, Any]) -> dict[str, str]:
+    """Keep only the string-valued FileIO properties the Rust binding accepts.
+
+    The Rust ``FileIO.from_props`` requires every value to be a ``str``. The REST catalog injects a
+    live ``LegacyOAuth2AuthManager`` object under ``auth.manager`` (for token refresh), which would
+    raise ``TypeError`` and crash every native scan. Dropping non-str values is a scoped fix for
+    static-credential FileIO (endpoint plus access key/secret/token, all strings) -- it deliberately
+    does NOT hand off a non-str auth manager, so signed/refreshing auth is not carried to the native
+    path. That is a known limitation, not a complete auth handoff.
+    """
+    return {key: value for key, value in properties.items() if isinstance(value, str)}
+
+
 def file_io_to_pyiceberg_core(file_io: FileIO) -> Any:
-    """Convert a PyIceberg FileIO to a pyiceberg-core FileIO-like object."""
-    return _core_module("file_io").FileIO.from_props(dict(file_io.properties))
+    """Convert a PyIceberg FileIO to a pyiceberg-core FileIO-like object.
+
+    Only string-valued properties are forwarded (see ``_string_props``), and two PyIceberg S3
+    properties are translated into the opendal-backed binding's own keys so MinIO/path-style and
+    region-required deployments work on the native path the same way they do on PyArrow.
+    """
+    props = _string_props(dict(file_io.properties))
+
+    # PyIceberg documents ``s3.force-virtual-addressing`` (default False on the s3 scan path), but
+    # the opendal S3 client reads ``s3.path-style-access``. Mirror the PyArrow default: path-style
+    # access is on unless virtual addressing was explicitly requested. Only set the binding key when
+    # it is not already provided, so an explicit native-side override still wins.
+    if "s3.path-style-access" not in props:
+        force_virtual_addressing = property_as_bool(props, S3_FORCE_VIRTUAL_ADDRESSING, False)
+        if not force_virtual_addressing:
+            props["s3.path-style-access"] = "true"
+
+    # The opendal S3 builder requires an explicit region (PyArrow resolves it implicitly). Fall back
+    # to PyIceberg's ``client.region`` property and finally the AWS_REGION OS env so the native path
+    # does not fail with "region is missing".
+    if S3_REGION not in props:
+        region = props.get(AWS_REGION) or os.environ.get("AWS_REGION")
+        if region:
+            props[S3_REGION] = region
+
+    return _core_module("file_io").FileIO.from_props(props)
 
 
 def _literal_value(value: Any) -> Any:

@@ -188,7 +188,39 @@ def test_schema_to_pyiceberg_core_uses_lazy_core_schema_json(simple_schema: Sche
 def test_file_io_to_pyiceberg_core_uses_file_io_properties() -> None:
     converted = file_io_to_pyiceberg_core(FakeFileIO(properties={"s3.region": "us-east-1"}))
 
-    assert converted.kwargs == {"properties": {"s3.region": "us-east-1"}}
+    # Region present, no force-virtual-addressing -> path-style is turned on (PyArrow default).
+    assert converted.kwargs == {"properties": {"s3.region": "us-east-1", "s3.path-style-access": "true"}}
+
+
+def test_file_io_to_pyiceberg_core_drops_non_str_props() -> None:
+    # The REST catalog injects a live auth-manager object under "auth.manager"; the Rust binding
+    # only accepts str values, so non-str props must be dropped rather than crashing the native scan.
+    file_io = FakeFileIO(properties={"s3.region": "us-east-1", "auth.manager": object()})
+    converted = file_io_to_pyiceberg_core(file_io)
+
+    assert "auth.manager" not in converted.kwargs["properties"]
+    assert converted.kwargs["properties"]["s3.region"] == "us-east-1"
+
+
+def test_file_io_to_pyiceberg_core_translates_path_style_for_minio() -> None:
+    file_io = FakeFileIO(properties={"s3.region": "us-east-1", "s3.force-virtual-addressing": "false"})
+    converted = file_io_to_pyiceberg_core(file_io)
+
+    assert converted.kwargs["properties"]["s3.path-style-access"] == "true"
+
+
+def test_file_io_to_pyiceberg_core_keeps_virtual_addressing() -> None:
+    file_io = FakeFileIO(properties={"s3.region": "us-east-1", "s3.force-virtual-addressing": "true"})
+    converted = file_io_to_pyiceberg_core(file_io)
+
+    assert "s3.path-style-access" not in converted.kwargs["properties"]
+
+
+def test_file_io_to_pyiceberg_core_falls_back_to_aws_region_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AWS_REGION", "eu-west-1")
+    converted = file_io_to_pyiceberg_core(FakeFileIO(properties={}))
+
+    assert converted.kwargs["properties"]["s3.region"] == "eu-west-1"
 
 
 def test_expression_to_pyiceberg_core_converts_expression_tree(simple_schema: Schema) -> None:
@@ -822,3 +854,75 @@ def test_plan_and_read_applies_limit(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert table.num_rows == 2  # the batch of 3 is truncated to the limit
     assert captured["reader_kwargs"]["batch_size"] == 2  # batch size capped to the limit
+
+
+def _bare_path_task(file_path: str) -> FileScanTask:
+    data_file = DataFile.from_args(
+        content=DataFileContent.DATA,
+        file_path=file_path,
+        file_format="PARQUET",
+        partition=Record(),
+        record_count=1,
+        file_size_in_bytes=1,
+    )
+    data_file.spec_id = 0
+    return FileScanTask(data_file)
+
+
+def test_native_scan_supports_paths_rejects_bare_paths() -> None:
+    from pyiceberg.table import _native_scan_supports_paths
+
+    assert _native_scan_supports_paths([_bare_path_task("s3://warehouse/t/data.parquet")])
+    # A bare local path (no scheme) crashes opendal, so the dispatch must fall back to PyArrow.
+    assert not _native_scan_supports_paths([_bare_path_task("/tmp/warehouse/t/data.parquet")])
+    assert not _native_scan_supports_paths([_bare_path_task("s3://warehouse/t/a.parquet"), _bare_path_task("/tmp/t/b.parquet")])
+
+
+def _prime_batch(value: int) -> pa.RecordBatch:
+    return pa.record_batch({"id": pa.array([value], pa.int32())})
+
+
+def test_prime_native_reader_preserves_batch_order() -> None:
+    from pyiceberg.table import _prime_native_reader
+
+    schema = pa.schema([pa.field("id", pa.int32())])
+    reader = pa.RecordBatchReader.from_batches(schema, iter([_prime_batch(1), _prime_batch(2), _prime_batch(3)]))
+
+    primed = _prime_native_reader(reader)
+
+    assert primed.read_all().column("id").to_pylist() == [1, 2, 3]
+
+
+def test_prime_native_reader_surfaces_error_before_first_batch() -> None:
+    from pyiceberg.table import _prime_native_reader
+
+    schema = pa.schema([pa.field("id", pa.int32())])
+
+    def _explode() -> Any:
+        raise pa.lib.ArrowInvalid("decode failed on first batch")
+        yield  # type: ignore[unreachable]  # pragma: no cover - generator marker
+
+    reader = pa.RecordBatchReader.from_batches(schema, _explode())
+
+    # The error must surface from _prime_native_reader so the caller's guard can fall back to PyArrow.
+    with pytest.raises(pa.lib.ArrowInvalid):
+        _prime_native_reader(reader)
+
+
+def test_prime_native_reader_propagates_mid_stream_error_without_restart() -> None:
+    from pyiceberg.table import _prime_native_reader
+
+    schema = pa.schema([pa.field("id", pa.int32())])
+
+    def _batches() -> Any:
+        yield _prime_batch(1)
+        raise pa.lib.ArrowInvalid("decode failed mid-stream")
+
+    reader = pa.RecordBatchReader.from_batches(schema, _batches())
+    primed = _prime_native_reader(reader)
+
+    # First batch was already handed out; a later failure must propagate (no silent fallback/restart
+    # that would re-emit the first batch).
+    assert primed.read_next_batch().column("id").to_pylist() == [1]
+    with pytest.raises(pa.lib.ArrowInvalid):
+        primed.read_next_batch()

@@ -114,6 +114,35 @@ PYICEBERG_RUST_ARROW_SCAN = "PYICEBERG_RUST_ARROW_SCAN"
 PYICEBERG_RUST_SCAN_PLANNING = "PYICEBERG_RUST_SCAN_PLANNING"
 
 
+def _native_scan_supports_paths(tasks: Iterable[FileScanTask]) -> bool:
+    """Return whether every planned data file has a URL scheme the native opendal reader can open.
+
+    The opendal-backed reader crashes on a bare local path (no ``scheme://``); the PyArrow path
+    reads those fine. Checking the planned task paths up front lets an unschemed path fall back to
+    PyArrow cleanly instead of crashing inside the native reader.
+    """
+    return all("://" in task.file.file_path for task in tasks)
+
+
+def _prime_native_reader(reader: pa.RecordBatchReader) -> pa.RecordBatchReader:
+    """Pull the first batch so a native decode failure surfaces before any batch is handed out.
+
+    The native reader builds eagerly but decodes lazily, so a binding mismatch can raise either at
+    construction or while the FIRST batch is decoded (e.g. the run-end-decode/cast in
+    pyiceberg_core). Forcing the first batch here lets the caller's guard fall back to PyArrow. The
+    primed batch is re-chained ahead of the rest, so iteration is unchanged. Once a batch has been
+    yielded a later error MUST propagate -- restarting on PyArrow would re-emit already returned rows
+    (silent duplication), so this only ever fronts the very first batch.
+    """
+    import pyarrow as pa
+
+    try:
+        first = reader.read_next_batch()
+    except StopIteration:
+        return reader
+    return pa.RecordBatchReader.from_batches(reader.schema, itertools.chain((first,), reader))
+
+
 @dataclass()
 class UpsertResult:
     """Summary the upsert operation."""
@@ -2245,21 +2274,34 @@ class DataScan(TableScan):
         from pyiceberg.io.pyarrow import ArrowScan, schema_to_pyarrow
 
         projected_schema = self.projection()
+
+        # An unsupported native scan should DEGRADE to PyArrow, not crash. The native reader builds
+        # eagerly but decodes lazily, so a binding mismatch can surface either at construction or
+        # while the FIRST batch is decoded (e.g. the run-end-decode/cast in pyiceberg_core). We prime
+        # that first batch under the guard and re-chain it; once any batch has been handed to the
+        # caller we MUST let later errors propagate -- restarting on PyArrow would re-emit already
+        # yielded rows (silent duplication). The catch is scoped to the native attempt only: the
+        # binding raises ValueError/NotImplementedError for unsupported scans and TypeError/
+        # ArrowInvalid for prop/decode mismatches; broader user errors still surface.
+        native_fallback_errors = (ModuleNotFoundError, NotImplementedError, ValueError, TypeError, pa.lib.ArrowInvalid)
+
         if os.environ.get(PYICEBERG_RUST_SCAN_PLANNING, "").lower() in {"1", "true", "yes"}:
             from pyiceberg.io.pyiceberg_core import plan_and_read_with_pyiceberg_core
 
             try:
-                return plan_and_read_with_pyiceberg_core(
-                    self.table_metadata,
-                    self.io,
-                    projected_schema,
-                    self.row_filter,
-                    self.table_identifier,
-                    case_sensitive=self.case_sensitive,
-                    snapshot_id=self.snapshot_id,
-                    limit=self.limit,
+                return _prime_native_reader(
+                    plan_and_read_with_pyiceberg_core(
+                        self.table_metadata,
+                        self.io,
+                        projected_schema,
+                        self.row_filter,
+                        self.table_identifier,
+                        case_sensitive=self.case_sensitive,
+                        snapshot_id=self.snapshot_id,
+                        limit=self.limit,
+                    )
                 )
-            except (ModuleNotFoundError, NotImplementedError, ValueError) as exc:
+            except native_fallback_errors as exc:
                 warnings.warn(
                     f"Falling back to PyArrow scan because pyiceberg-core cannot handle this scan: {exc}",
                     RuntimeWarning,
@@ -2275,23 +2317,34 @@ class DataScan(TableScan):
             if can_read_projected_schema_with_pyiceberg_core(
                 self.table_metadata.schema(), projected_schema, self.row_filter, self.case_sensitive
             ):
-                try:
-                    return arrow_batch_reader_from_pyiceberg_core(
-                        self.io,
-                        self.plan_files(),
-                        self.table_metadata.schema(),
-                        projected_schema,
-                        self.table_metadata.specs(),
-                        self.table_metadata.name_mapping(),
-                        self.case_sensitive,
-                        limit=self.limit,
-                    )
-                except (ModuleNotFoundError, NotImplementedError, ValueError) as exc:
+                # Plan once and reuse: the bare-path guard inspects the same tasks the reader gets.
+                native_tasks = list(self.plan_files())
+                if not _native_scan_supports_paths(native_tasks):
                     warnings.warn(
-                        f"Falling back to PyArrow scan because pyiceberg-core cannot handle this scan: {exc}",
+                        "Falling back to PyArrow scan because pyiceberg-core cannot read a data file path without a URL scheme.",
                         RuntimeWarning,
                         stacklevel=2,
                     )
+                else:
+                    try:
+                        return _prime_native_reader(
+                            arrow_batch_reader_from_pyiceberg_core(
+                                self.io,
+                                native_tasks,
+                                self.table_metadata.schema(),
+                                projected_schema,
+                                self.table_metadata.specs(),
+                                self.table_metadata.name_mapping(),
+                                self.case_sensitive,
+                                limit=self.limit,
+                            )
+                        )
+                    except native_fallback_errors as exc:
+                        warnings.warn(
+                            f"Falling back to PyArrow scan because pyiceberg-core cannot handle this scan: {exc}",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
 
         target_schema = schema_to_pyarrow(projected_schema)
         batches = ArrowScan(
