@@ -69,6 +69,7 @@ from pyiceberg.io.pyarrow import (
     PyArrowFile,
     PyArrowFileIO,
     StatsAggregator,
+    _apply_equality_deletes,
     _check_pyarrow_schema_compatible,
     _ConvertToArrowSchema,
     _determine_partitions,
@@ -1971,11 +1972,41 @@ def test_equality_delete_no_match(tmp_path: Path) -> None:
         schema=schema,
         data_rows=[{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}],
         equality_ids=[1],
-        delete_rows=[{"id": 5}],
+        delete_rows=[{"id": 2}, {"id": 99}],
         delete_key_fields=[("id", pa.int32(), 1)],
     )
 
-    assert result.column("id").to_pylist() == [1, 2, 3, 4]
+    assert result.column("id").to_pylist() == [1, 3, 4]
+
+
+def test_equality_delete_multi_batch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    schema = Schema(NestedField(1, "id", IntegerType(), required=True))
+    num_rows = 200_000
+    delete_ids = {0, 50_000, 199_999}
+    batch_sizes: list[int] = []
+
+    def apply_equality_deletes_with_batch_tracking(batch: pa.RecordBatch, *args: Any, **kwargs: Any) -> pa.RecordBatch:
+        batch_sizes.append(batch.num_rows)
+        return _apply_equality_deletes(batch, *args, **kwargs)
+
+    monkeypatch.setattr("pyiceberg.io.pyarrow._apply_equality_deletes", apply_equality_deletes_with_batch_tracking)
+
+    result = _scan_with_equality_delete(
+        tmp_path=tmp_path,
+        schema=schema,
+        data_rows=[{"id": row_id} for row_id in range(num_rows)],
+        equality_ids=[1],
+        delete_rows=[{"id": row_id} for row_id in delete_ids],
+        delete_key_fields=[("id", pa.int32(), 1)],
+    )
+
+    ids = result.column("id").to_pylist()
+
+    assert len(batch_sizes) > 1
+    assert sum(batch_sizes) == num_rows
+    assert result.num_rows == num_rows - len(delete_ids)
+    assert delete_ids.isdisjoint(ids)
+    assert {1, 49_999, 50_001, 199_998}.issubset(ids)
 
 
 def test_equality_delete_null_key(tmp_path: Path) -> None:
