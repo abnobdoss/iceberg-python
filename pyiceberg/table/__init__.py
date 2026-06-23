@@ -41,9 +41,9 @@ from pyiceberg.expressions.visitors import (
     manifest_evaluator,
 )
 from pyiceberg.io import FileIO, load_file_io
-from pyiceberg.manifest import DataFile, DataFileContent, ManifestContent, ManifestEntry, ManifestFile
+from pyiceberg.manifest import DataFile, DataFileContent, ManifestContent, ManifestEntry, ManifestEntryStatus, ManifestFile
 from pyiceberg.partitioning import PARTITION_FIELD_ID_START, UNPARTITIONED_PARTITION_SPEC, PartitionKey, PartitionSpec
-from pyiceberg.schema import Schema
+from pyiceberg.schema import RESERVED_METADATA_COLUMNS_BY_NAME, Schema
 from pyiceberg.table.delete_file_index import DeleteFileIndex
 from pyiceberg.table.inspect import InspectTable
 from pyiceberg.table.locations import LocationProvider, load_location_provider
@@ -90,7 +90,7 @@ from pyiceberg.typedef import (
     Record,
     TableVersion,
 )
-from pyiceberg.types import strtobool
+from pyiceberg.types import NestedField, strtobool
 from pyiceberg.utils.concurrent import ExecutorFactory
 from pyiceberg.utils.config import Config
 from pyiceberg.utils.properties import property_as_bool
@@ -110,6 +110,13 @@ if TYPE_CHECKING:
 
 ALWAYS_TRUE = AlwaysTrue()
 DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE = "downcast-ns-timestamp-to-us-on-write"
+_RESERVED_METADATA_COLUMNS_BY_NAME_LOWER = {name.lower(): field for name, field in RESERVED_METADATA_COLUMNS_BY_NAME.items()}
+
+
+def _reserved_metadata_field(name: str, case_sensitive: bool) -> NestedField | None:
+    if case_sensitive:
+        return RESERVED_METADATA_COLUMNS_BY_NAME.get(name)
+    return _RESERVED_METADATA_COLUMNS_BY_NAME_LOWER.get(name.lower())
 
 
 @dataclass()
@@ -1974,10 +1981,40 @@ class TableScan(BaseScan):
             else:
                 raise ValueError(f"Snapshot not found: {self.snapshot_id}")
 
-        if "*" in self.selected_fields:
-            return current_schema
+        metadata_fields: list[NestedField] = []
+        metadata_field_ids: set[int] = set()
+        for field_name in self.selected_fields:
+            if metadata_field := _reserved_metadata_field(field_name, self.case_sensitive):
+                if metadata_field.field_id not in metadata_field_ids:
+                    metadata_fields.append(metadata_field)
+                    metadata_field_ids.add(metadata_field.field_id)
 
-        return current_schema.select(*self.selected_fields, case_sensitive=self.case_sensitive)
+        if "*" in self.selected_fields:
+            if not metadata_fields:
+                return current_schema
+            return Schema(
+                *current_schema.fields,
+                *metadata_fields,
+                schema_id=current_schema.schema_id,
+                identifier_field_ids=current_schema.identifier_field_ids,
+            )
+
+        selected_data_fields = tuple(
+            field_name
+            for field_name in self.selected_fields
+            if _reserved_metadata_field(field_name, self.case_sensitive) is None
+        )
+        if selected_data_fields:
+            data_projection = current_schema.select(*selected_data_fields, case_sensitive=self.case_sensitive)
+        else:
+            data_projection = Schema(schema_id=current_schema.schema_id)
+
+        return Schema(
+            *data_projection.fields,
+            *metadata_fields,
+            schema_id=data_projection.schema_id,
+            identifier_field_ids=data_projection.identifier_field_ids,
+        )
 
     def use_ref(self: S, name: str) -> S:
         if self.snapshot_id:
@@ -2002,16 +2039,19 @@ class FileScanTask(ScanTask):
     file: DataFile
     delete_files: set[DataFile]
     residual: BooleanExpression
+    data_sequence_number: int | None
 
     def __init__(
         self,
         data_file: DataFile,
         delete_files: set[DataFile] | None = None,
         residual: BooleanExpression = ALWAYS_TRUE,
+        data_sequence_number: int | None = None,
     ) -> None:
         self.file = data_file
         self.delete_files = delete_files or set()
         self.residual = residual
+        self.data_sequence_number = data_sequence_number
 
     @staticmethod
     def from_rest_response(
@@ -2079,6 +2119,8 @@ def _rest_file_to_data_file(rest_file: RESTContentFile) -> DataFile:
         sort_order_id=rest_file.sort_order_id,
     )
     data_file.spec_id = rest_file.spec_id
+    if isinstance(rest_file, RESTDataFile):
+        data_file.first_row_id = rest_file.first_row_id
     return data_file
 
 
@@ -2093,10 +2135,22 @@ def _open_manifest(
     Returns:
         A list of ManifestEntry that matches the provided filters.
     """
+    entries = list(manifest.fetch_manifest_entry(io, discard_deleted=False))
+    if manifest.content == ManifestContent.DATA and manifest.first_row_id is not None:
+        next_row_id = manifest.first_row_id
+        for manifest_entry in entries:
+            data_file = manifest_entry.data_file
+            if data_file.content != DataFileContent.DATA:
+                continue
+            if data_file.first_row_id is None:
+                data_file.first_row_id = next_row_id
+                next_row_id += data_file.record_count
     return [
         manifest_entry
-        for manifest_entry in manifest.fetch_manifest_entry(io, discard_deleted=True)
-        if partition_filter(manifest_entry.data_file) and metrics_evaluator(manifest_entry.data_file)
+        for manifest_entry in entries
+        if manifest_entry.status != ManifestEntryStatus.DELETED
+        and partition_filter(manifest_entry.data_file)
+        and metrics_evaluator(manifest_entry.data_file)
     ]
 
 
@@ -2236,7 +2290,7 @@ class DataScan(TableScan):
 
         from pyiceberg.io.pyarrow import ArrowScan, schema_to_pyarrow
 
-        target_schema = schema_to_pyarrow(self.projection())
+        target_schema = schema_to_pyarrow(self.projection(), include_field_ids=False)
         batches = ArrowScan(
             self.table_metadata,
             self.io,
@@ -2378,6 +2432,7 @@ class ManifestGroupPlanner:
                 residual=residual_evaluators[data_entry.data_file.spec_id](data_entry.data_file).residual_for(
                     data_entry.data_file.partition
                 ),
+                data_sequence_number=data_entry.sequence_number,
             )
             for data_entry in data_entries
         ]
