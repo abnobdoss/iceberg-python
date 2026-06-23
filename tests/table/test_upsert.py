@@ -14,6 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+from collections.abc import Generator
 from pathlib import PosixPath
 
 import pyarrow as pa
@@ -35,10 +36,11 @@ from tests.catalog.test_base import InMemoryCatalog
 
 
 @pytest.fixture
-def catalog(tmp_path: PosixPath) -> InMemoryCatalog:
+def catalog(tmp_path: PosixPath) -> Generator[InMemoryCatalog, None, None]:
     catalog = InMemoryCatalog("test.in_memory.catalog", warehouse=tmp_path.absolute().as_posix())
     catalog.create_namespace("default")
-    return catalog
+    yield catalog
+    catalog.close()
 
 
 def _drop_table(catalog: Catalog, identifier: str) -> None:
