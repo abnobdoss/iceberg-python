@@ -329,6 +329,19 @@ def test_table_scan_branch_with_tag_ref_raises(table_v2: Table) -> None:
         table_v2.scan(branch="test")
 
 
+def test_table_scan_tag_with_branch_ref_raises(table_v2: Table) -> None:
+    # `main` is synthesized as a BRANCH ref from current-snapshot-id; scanning it as a tag must fail.
+    with pytest.raises(ValueError, match="Ref main is not a tag"):
+        table_v2.scan(tag="main")
+
+
+def test_table_scan_branch_keyword_main(table_v2: Table) -> None:
+    # The `main` branch ref is synthesized from current-snapshot-id and must be scannable by name.
+    scan = table_v2.scan(branch="main")
+
+    assert scan.snapshot_id == table_v2.metadata.current_snapshot_id
+
+
 def test_table_scan_ref_does_not_exists(table_v2: Table) -> None:
     scan = table_v2.scan()
 
