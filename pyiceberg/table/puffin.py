@@ -30,6 +30,9 @@ from pyiceberg.typedef import IcebergBaseModel
 if TYPE_CHECKING:
     import pyarrow as pa
 
+    from pyiceberg.manifest import DataFile
+    from pyiceberg.typedef import Record
+
 # Short for: Puffin Fratercula arctica, version 1
 MAGIC_BYTES = b"PFA1"
 DELETION_VECTOR_MAGIC = b"\xd1\xd3\x39\x64"
@@ -164,12 +167,15 @@ class PuffinWriter:
     _blobs: list[PuffinBlobMetadata]
     _blob_payloads: list[bytes]
     _created_by: str
+    written_blobs: list[PuffinBlobMetadata]
+    """Blob metadata (with resolved offset/length) of the blobs written by ``finish()``."""
 
     def __init__(self, output_file: OutputFile, created_by: str | None = None) -> None:
         self._output_file = output_file
         self._blobs = []
         self._blob_payloads = []
         self._created_by = created_by if created_by is not None else f"PyIceberg version {__version__}"
+        self.written_blobs = []
 
     def set_blob(
         self,
@@ -245,7 +251,59 @@ class PuffinWriter:
 
             puffin_bytes = out.getvalue()
 
+        self.written_blobs = blobs_metadata
+
         with self._output_file.create(overwrite=True) as output_stream:
             output_stream.write(puffin_bytes)
 
         return len(puffin_bytes)
+
+
+def write_deletion_vector(
+    output_file: OutputFile,
+    referenced_data_file: str,
+    positions: Iterable[int],
+    partition: "Record",
+    spec_id: int,
+) -> "DataFile":
+    """Write a single-blob deletion-vector Puffin file and return its manifest entry DataFile.
+
+    The returned ``DataFile`` has ``content == POSITION_DELETES`` and
+    ``file_format == PUFFIN`` (the Iceberg spec models a v3 deletion vector as a
+    position-delete file whose physical format is Puffin; there is no distinct
+    ``DataFileContent`` enum value). It carries ``referenced_data_file`` (field 143),
+    ``content_offset`` (field 144) and ``content_size_in_bytes`` (field 145) so the
+    scan planner can locate and apply the blob.
+
+    Args:
+        output_file: Destination for the ``.puffin`` file.
+        referenced_data_file: Path of the data file the positions refer to.
+        positions: Zero-based row positions to delete in the referenced data file.
+        partition: Partition record of the referenced data file (deletes share its partition).
+        spec_id: Partition spec id of the referenced data file.
+    """
+    from pyiceberg.manifest import DataFile, DataFileContent, FileFormat
+
+    positions = sorted(set(positions))
+
+    writer = PuffinWriter(output_file)
+    writer.set_blob(positions, referenced_data_file)
+    file_size = writer.finish()
+
+    if len(writer.written_blobs) != 1:
+        raise ValueError("Expected exactly one deletion-vector blob to be written")
+    blob = writer.written_blobs[0]
+
+    data_file = DataFile.from_args(
+        content=DataFileContent.POSITION_DELETES,
+        file_path=output_file.location,
+        file_format=FileFormat.PUFFIN,
+        partition=partition,
+        record_count=len(positions),
+        file_size_in_bytes=file_size,
+        referenced_data_file=referenced_data_file,
+        content_offset=blob.offset,
+        content_size_in_bytes=blob.length,
+    )
+    data_file.spec_id = spec_id
+    return data_file

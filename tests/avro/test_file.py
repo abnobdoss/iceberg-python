@@ -164,8 +164,10 @@ def test_write_manifest_entry_with_iceberg_read_with_fastavro_v1() -> None:
         del v2_entry["file_sequence_number"]
         del v2_entry["data_file"]["content"]
         del v2_entry["data_file"]["equality_ids"]
-        # first_row_id (field 142) is a v3-only DataFile field, not present in the V1/V2 schema.
-        v2_entry["data_file"].pop("first_row_id", None)
+        # first_row_id (142) and the deletion-vector fields (143-145) are v3-only
+        # DataFile fields, not present in the V1/V2 schema.
+        for v3_only_field in ("first_row_id", "referenced_data_file", "content_offset", "content_size_in_bytes"):
+            v2_entry["data_file"].pop(v3_only_field, None)
 
         # Required in V1
         v2_entry["data_file"]["block_size_in_bytes"] = DEFAULT_BLOCK_SIZE
@@ -225,8 +227,10 @@ def test_write_manifest_entry_with_iceberg_read_with_fastavro_v2() -> None:
             fa_entry = next(it)
 
         v2_entry = todict(entry)
-        # first_row_id (field 142) is a v3-only DataFile field, not present in the V2 schema.
-        v2_entry["data_file"].pop("first_row_id", None)
+        # first_row_id (142) and the deletion-vector fields (143-145) are v3-only
+        # DataFile fields, not present in the V2 schema.
+        for v3_only_field in ("first_row_id", "referenced_data_file", "content_offset", "content_size_in_bytes"):
+            v2_entry["data_file"].pop(v3_only_field, None)
         assert v2_entry == fa_entry
 
 

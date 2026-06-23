@@ -589,6 +589,56 @@ class _FastAppendFiles(_SnapshotProducer["_FastAppendFiles"]):
         return []
 
 
+class _AppendDeletionVectors(_FastAppendFiles):
+    """Appends deletion-vector (Puffin) delete files, producing a DELETE snapshot.
+
+    Each added file must be a ``DataFileContent.POSITION_DELETES`` file with
+    ``file_format == FileFormat.PUFFIN`` and a populated ``referenced_data_file``
+    (field 143). They are written into a DELETES manifest so the scan planner routes
+    them through the delete-file index and the existing Puffin reader applies them.
+    """
+
+    def _manifests(self) -> list[ManifestFile]:
+        if not self._added_data_files:
+            raise ValueError("No deletion vectors to commit")
+
+        def _write_dv_manifest() -> list[ManifestFile]:
+            with write_manifest(
+                format_version=self._transaction.table_metadata.format_version,
+                spec=self._transaction.table_metadata.spec(),
+                schema=self.schema(),
+                output_file=self.new_manifest_output(),
+                snapshot_id=self._snapshot_id,
+                avro_compression=self._compression,
+                content=ManifestContent.DELETES,
+            ) as writer:
+                for data_file in self._added_data_files:
+                    writer.add(
+                        ManifestEntry.from_args(
+                            status=ManifestEntryStatus.ADDED,
+                            snapshot_id=self._snapshot_id,
+                            sequence_number=None,
+                            file_sequence_number=None,
+                            data_file=data_file,
+                        )
+                    )
+            return [writer.to_manifest_file()]
+
+        return self._process_manifests(_write_dv_manifest() + self._existing_manifests())
+
+    def _summary(self, snapshot_properties: dict[str, str] = EMPTY_DICT) -> Summary:
+        ssc = SnapshotSummaryCollector(partition_summary_limit=0)
+        previous_snapshot = (
+            self._transaction.table_metadata.snapshot_by_id(self._parent_snapshot_id)
+            if self._parent_snapshot_id is not None
+            else None
+        )
+        return update_snapshot_summaries(
+            summary=Summary(operation=self._operation, **ssc.build(), **snapshot_properties),
+            previous_summary=previous_snapshot.summary if previous_snapshot is not None else None,
+        )
+
+
 class _MergeAppendFiles(_FastAppendFiles):
     _target_size_bytes: int
     _min_count_to_merge: int
@@ -782,6 +832,17 @@ class UpdateSnapshot:
 
     def delete(self) -> _DeleteFiles:
         return _DeleteFiles(
+            operation=Operation.DELETE,
+            transaction=self._transaction,
+            io=self._io,
+            branch=self._branch,
+            snapshot_properties=self._snapshot_properties,
+        )
+
+    def append_deletion_vectors(self) -> _AppendDeletionVectors:
+        if self._transaction.table_metadata.format_version < 3:
+            raise ValueError("Deletion vectors require table format version 3 or higher")
+        return _AppendDeletionVectors(
             operation=Operation.DELETE,
             transaction=self._transaction,
             io=self._io,

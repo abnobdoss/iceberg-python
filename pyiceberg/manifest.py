@@ -550,6 +550,27 @@ class DataFile(Record):
             raise ValueError("Cannot set first_row_id: record has no field-142 slot")
         self._data[16] = value
 
+    @property
+    def referenced_data_file(self) -> str | None:
+        """Location of the data file that all deletes in this file reference (field 143, v3+)."""
+        if len(self._data) > 17:
+            return self._data[17]
+        return None
+
+    @property
+    def content_offset(self) -> int | None:
+        """Offset in the file where the deletion-vector blob starts (field 144, v3+)."""
+        if len(self._data) > 18:
+            return self._data[18]
+        return None
+
+    @property
+    def content_size_in_bytes(self) -> int | None:
+        """Length of the referenced deletion-vector blob (field 145, v3+)."""
+        if len(self._data) > 19:
+            return self._data[19]
+        return None
+
     # Spec ID should not be stored in the file
     _spec_id: int
 
@@ -1061,6 +1082,7 @@ class ManifestWriter(ABC):
     _min_sequence_number: int | None
     _partitions: list[Record]
     _compression: AvroCompressionCodec
+    _content: ManifestContent
 
     def __init__(
         self,
@@ -1069,12 +1091,14 @@ class ManifestWriter(ABC):
         output_file: OutputFile,
         snapshot_id: int,
         avro_compression: AvroCompressionCodec,
+        content: ManifestContent = ManifestContent.DATA,
     ) -> None:
         self.closed = False
         self._spec = spec
         self._schema = schema
         self._output_file = output_file
         self._snapshot_id = snapshot_id
+        self._content = content
 
         self._added_files = 0
         self._added_rows = 0
@@ -1239,8 +1263,11 @@ class ManifestWriterV1(ManifestWriter):
         output_file: OutputFile,
         snapshot_id: int,
         avro_compression: AvroCompressionCodec,
+        content: ManifestContent = ManifestContent.DATA,
     ):
-        super().__init__(spec, schema, output_file, snapshot_id, avro_compression)
+        if content != ManifestContent.DATA:
+            raise ValueError("Cannot write delete manifests in a v1 table")
+        super().__init__(spec, schema, output_file, snapshot_id, avro_compression, content)
 
     def content(self) -> ManifestContent:
         return ManifestContent.DATA
@@ -1261,11 +1288,12 @@ class ManifestWriterV2(ManifestWriter):
         output_file: OutputFile,
         snapshot_id: int,
         avro_compression: AvroCompressionCodec,
+        content: ManifestContent = ManifestContent.DATA,
     ):
-        super().__init__(spec, schema, output_file, snapshot_id, avro_compression)
+        super().__init__(spec, schema, output_file, snapshot_id, avro_compression, content)
 
     def content(self) -> ManifestContent:
-        return ManifestContent.DATA
+        return self._content
 
     @property
     def version(self) -> TableVersion:
@@ -1275,7 +1303,7 @@ class ManifestWriterV2(ManifestWriter):
     def _meta(self) -> dict[str, str]:
         return {
             **super()._meta,
-            "content": "data",
+            "content": "deletes" if self._content == ManifestContent.DELETES else "data",
         }
 
     def prepare_entry(self, entry: ManifestEntry) -> ManifestEntry:
@@ -1300,13 +1328,14 @@ def write_manifest(
     output_file: OutputFile,
     snapshot_id: int,
     avro_compression: AvroCompressionCodec,
+    content: ManifestContent = ManifestContent.DATA,
 ) -> ManifestWriter:
     if format_version == 1:
-        return ManifestWriterV1(spec, schema, output_file, snapshot_id, avro_compression)
+        return ManifestWriterV1(spec, schema, output_file, snapshot_id, avro_compression, content)
     elif format_version == 2:
-        return ManifestWriterV2(spec, schema, output_file, snapshot_id, avro_compression)
+        return ManifestWriterV2(spec, schema, output_file, snapshot_id, avro_compression, content)
     elif format_version == 3:
-        return ManifestWriterV3(spec, schema, output_file, snapshot_id, avro_compression)
+        return ManifestWriterV3(spec, schema, output_file, snapshot_id, avro_compression, content)
     else:
         raise ValueError(f"Cannot write manifest for table version: {format_version}")
 
