@@ -531,6 +531,23 @@ class DataFile(Record):
     def sort_order_id(self) -> int | None:
         return self._data[15]
 
+    @property
+    def first_row_id(self) -> int | None:
+        """The _row_id for the first row in the data file (field 142, v3+ only).
+
+        Older (v1/v2) DataFile structs do not carry this field, so we return
+        ``None`` when the underlying record is too short to hold it.
+        """
+        if len(self._data) > 16:
+            return self._data[16]
+        return None
+
+    @first_row_id.setter
+    def first_row_id(self, value: int | None) -> None:
+        if len(self._data) <= 16:
+            raise ValueError("Cannot set first_row_id on a non-v3 DataFile (field 142 absent)")
+        self._data[16] = value
+
     # Spec ID should not be stored in the file
     _spec_id: int
 
@@ -548,6 +565,23 @@ class DataFile(Record):
         if name == "file_format":
             value = FileFormat[value]
         super().__setattr__(name, value)
+
+    def __copy__(self) -> DataFile:
+        """Return a copy whose ``_data`` list is independent from the original.
+
+        ``Record`` stores its fields in a mutable ``_data`` list, so the default
+        ``copy.copy`` would share that list and a mutation on the copy (e.g.
+        assigning ``first_row_id`` while materializing row lineage on a delete)
+        would leak back into the source DataFile. Copying the list isolates
+        field-level mutations to the copy while preserving ``_spec_id``.
+        """
+        cls = self.__class__
+        new = cls.__new__(cls)
+        new._data = list(self._data)
+        instance_dict = getattr(self, "__dict__", None)
+        if instance_dict:
+            new.__dict__.update(instance_dict)
+        return new
 
     def __hash__(self) -> int:
         """Return the hash of the file path."""
