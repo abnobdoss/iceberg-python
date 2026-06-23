@@ -21,18 +21,46 @@ import gzip
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 
+import zstandard as zstd
+
 from pyiceberg.io import InputFile, InputStream, OutputFile
 from pyiceberg.table.metadata import TableMetadata, TableMetadataUtil
 from pyiceberg.typedef import UTF8
 from pyiceberg.utils.config import Config
 
 GZIP = "gzip"
+NONE = "none"
+ZSTD = "zstd"
 
 
 class Compressor(ABC):
     @staticmethod
     def get_compressor(location: str) -> Compressor:
-        return GzipCompressor() if location.endswith(".gz.metadata.json") else NOOP_COMPRESSOR
+        if location.endswith((".gz.metadata.json", ".metadata.json.gz")):
+            return GzipCompressor()
+        elif location.endswith(".zst.metadata.json"):
+            return ZstdCompressor()
+        else:
+            # Plain ".metadata.json" or any non-metadata file: no decompression.
+            # NB: an unknown codec extension (e.g. ".lz4.metadata.json") falls through
+            # to NOOP here, matching Java's TableMetadataParser.Codec.fromFileName,
+            # which treats any non-".gz" infix as NONE.
+            return NOOP_COMPRESSOR
+
+    @staticmethod
+    def from_codec_name(codec_name: str | None) -> Compressor:
+        if codec_name is None:
+            return NOOP_COMPRESSOR
+
+        normalized_codec_name = codec_name.lower()
+        if normalized_codec_name == NONE:
+            return NOOP_COMPRESSOR
+        elif normalized_codec_name == GZIP:
+            return GzipCompressor()
+        elif normalized_codec_name == ZSTD:
+            return ZstdCompressor()
+        else:
+            raise ValueError(f"Unsupported metadata compression codec: {codec_name}")
 
     @abstractmethod
     def stream_decompressor(self, inp: InputStream) -> InputStream:
@@ -71,6 +99,26 @@ class GzipCompressor(Compressor):
 
     def bytes_compressor(self) -> Callable[[bytes], bytes]:
         return gzip.compress
+
+
+# Zstd metadata compression is experimental and non-standard; Spark/Java readers cannot read it.
+class ZstdCompressor(Compressor):
+    def stream_decompressor(self, inp: InputStream) -> InputStream:
+        return zstd.ZstdDecompressor().stream_reader(inp)
+
+    def bytes_compressor(self) -> Callable[[bytes], bytes]:
+        return lambda b: zstd.ZstdCompressor().compress(b)
+
+
+def metadata_file_extension(codec_name: str | None) -> str:
+    Compressor.from_codec_name(codec_name)
+
+    normalized_codec_name = NONE if codec_name is None else codec_name.lower()
+    return {
+        NONE: ".metadata.json",
+        GZIP: ".gz.metadata.json",
+        ZSTD: ".zst.metadata.json",
+    }[normalized_codec_name]
 
 
 class FromByteStream:
