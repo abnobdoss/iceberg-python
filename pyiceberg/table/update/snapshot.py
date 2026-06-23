@@ -1040,12 +1040,14 @@ class ExpireSnapshots(UpdateTableMetadata["ExpireSnapshots"]):
     _updates: tuple[TableUpdate, ...]
     _requirements: tuple[TableRequirement, ...]
     _snapshot_ids_to_expire: set[int]
+    _retain_last: int | None
 
     def __init__(self, transaction: Transaction) -> None:
         super().__init__(transaction)
         self._updates = ()
         self._requirements = ()
         self._snapshot_ids_to_expire = set()
+        self._retain_last = None
 
     def _commit(self) -> UpdatesAndRequirements:
         """
@@ -1060,6 +1062,23 @@ class ExpireSnapshots(UpdateTableMetadata["ExpireSnapshots"]):
         # Remove any protected snapshot IDs from the set to expire, just in case
         protected_ids = self._get_protected_snapshot_ids()
         self._snapshot_ids_to_expire -= protected_ids
+
+        if self._retain_last is not None:
+            unprotected_snapshots = sorted(
+                [
+                    snapshot
+                    for snapshot in self._transaction.table_metadata.snapshots
+                    if snapshot.snapshot_id not in protected_ids
+                ],
+                key=lambda snapshot: (snapshot.timestamp_ms, snapshot.snapshot_id),
+                reverse=True,
+            )
+            keep_ids = {snapshot.snapshot_id for snapshot in unprotected_snapshots[: self._retain_last]}
+            surplus_ids = {snapshot.snapshot_id for snapshot in unprotected_snapshots[self._retain_last :]}
+
+            self._snapshot_ids_to_expire |= surplus_ids
+            self._snapshot_ids_to_expire -= keep_ids
+
         update = RemoveSnapshotsUpdate(snapshot_ids=self._snapshot_ids_to_expire)
         self._updates += (update,)
         return self._updates, self._requirements
@@ -1130,4 +1149,24 @@ class ExpireSnapshots(UpdateTableMetadata["ExpireSnapshots"]):
         for snapshot in self._transaction.table_metadata.snapshots:
             if snapshot.timestamp_ms < expire_from and snapshot.snapshot_id not in protected_ids:
                 self._snapshot_ids_to_expire.add(snapshot.snapshot_id)
+        return self
+
+    def retain_last(self, num_snapshots: int) -> ExpireSnapshots:
+        """
+        Keep at least the N most-recent unprotected snapshots.
+
+        This is a retention floor: snapshots selected by other expiration rules, such as older_than,
+        are kept if they are among the N newest unprotected snapshots by timestamp. Protected
+        snapshots, such as branch or tag heads, are always kept and are not counted toward N.
+
+        Args:
+            num_snapshots (int): Number of newest unprotected snapshots to retain.
+
+        Returns:
+            This for method chaining.
+        """
+        if num_snapshots < 1:
+            raise ValueError("Number of snapshots to retain must be at least 1")
+
+        self._retain_last = num_snapshots
         return self
