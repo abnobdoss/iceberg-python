@@ -1718,6 +1718,7 @@ def test_add_snapshot_update_fails_with_smaller_first_row_id(table_v3: Table) ->
         summary=Summary(Operation.APPEND),
         schema_id=3,
         first_row_id=0,
+        added_rows=10,
     )
 
     with pytest.raises(
@@ -1725,6 +1726,45 @@ def test_add_snapshot_update_fails_with_smaller_first_row_id(table_v3: Table) ->
         match="Cannot add a snapshot with first row id smaller than the table's next-row-id",
     ):
         update_table_metadata(table_v3.metadata, (AddSnapshotUpdate(snapshot=new_snapshot),))
+
+
+def test_add_snapshot_update_fails_without_added_rows(table_v3: Table) -> None:
+    new_snapshot = Snapshot(
+        snapshot_id=25,
+        parent_snapshot_id=19,
+        sequence_number=200,
+        timestamp_ms=1602638593590,
+        manifest_list="s3:/a/b/c.avro",
+        summary=Summary(Operation.APPEND),
+        schema_id=3,
+        first_row_id=1,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Cannot add snapshot without added rows",
+    ):
+        update_table_metadata(table_v3.metadata, (AddSnapshotUpdate(snapshot=new_snapshot),))
+
+
+def test_add_snapshot_update_fails_with_null_table_next_row_id(table_v3: Table) -> None:
+    new_snapshot = Snapshot(
+        snapshot_id=25,
+        parent_snapshot_id=19,
+        sequence_number=200,
+        timestamp_ms=1602638593590,
+        manifest_list="s3:/a/b/c.avro",
+        summary=Summary(Operation.APPEND),
+        schema_id=3,
+        first_row_id=1,
+        added_rows=10,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Cannot add a snapshot when table next-row-id is null",
+    ):
+        update_table_metadata(table_v3.metadata.model_copy(update={"next_row_id": None}), (AddSnapshotUpdate(snapshot=new_snapshot),))
 
 
 def test_add_snapshot_update_updates_next_row_id(table_v3: Table) -> None:

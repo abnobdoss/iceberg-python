@@ -264,8 +264,9 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         )
 
     def _commit(self) -> UpdatesAndRequirements:
+        table_metadata = self._transaction.table_metadata
         new_manifests = self._manifests()
-        next_sequence_number = self._transaction.table_metadata.next_sequence_number()
+        next_sequence_number = table_metadata.next_sequence_number()
 
         summary = self._summary(self.snapshot_properties)
         file_name = _new_manifest_list_file_name(
@@ -276,20 +277,31 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         location_provider = self._transaction._table.location_provider()
         manifest_list_file_path = location_provider.new_metadata_location(file_name)
 
+        if table_metadata.format_version >= 3:
+            snapshot_first_row_id = table_metadata.next_row_id
+            if snapshot_first_row_id is None:
+                raise ValueError("Cannot commit to a v3 table without next-row-id")
+        else:
+            snapshot_first_row_id = None
+
         with write_manifest_list(
-            format_version=self._transaction.table_metadata.format_version,
+            format_version=table_metadata.format_version,
             output_file=self._io.new_output(manifest_list_file_path),
             snapshot_id=self._snapshot_id,
             parent_snapshot_id=self._parent_snapshot_id,
             sequence_number=next_sequence_number,
             avro_compression=self._compression,
+            snapshot_first_row_id=snapshot_first_row_id,
         ) as writer:
             writer.add_manifests(new_manifests)
 
-        first_row_id: int | None = None
-
-        if self._transaction.table_metadata.format_version >= 3:
-            first_row_id = self._transaction.table_metadata.next_row_id
+        if table_metadata.format_version >= 3:
+            if writer.next_row_id is None or snapshot_first_row_id is None:
+                raise ValueError("Cannot determine added rows for a v3 snapshot without row IDs")
+            added_rows = writer.next_row_id - snapshot_first_row_id
+        else:
+            added_rows = None
+        first_row_id = snapshot_first_row_id
 
         snapshot = Snapshot(
             snapshot_id=self._snapshot_id,
@@ -297,8 +309,9 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             manifest_list=manifest_list_file_path,
             sequence_number=next_sequence_number,
             summary=summary,
-            schema_id=self._transaction.table_metadata.current_schema_id,
+            schema_id=table_metadata.current_schema_id,
             first_row_id=first_row_id,
+            added_rows=added_rows,
         )
 
         add_snapshot_update = AddSnapshotUpdate(snapshot=snapshot)
@@ -764,20 +777,78 @@ class _ManifestMergeManager(Generic[U]):
                         # add all non-deleted files from the old manifest as existing files
                         writer.existing(entry)
 
-        return writer.to_manifest_file()
+        merged_manifest = writer.to_manifest_file()
+        inherited_first_row_ids = [
+            manifest.first_row_id
+            for manifest in manifest_bin
+            if manifest.content == ManifestContent.DATA and manifest.first_row_id is not None
+        ]
+        if inherited_first_row_ids:
+            merged_manifest.first_row_id = min(inherited_first_row_ids)
+
+        return merged_manifest
+
+    def _v3_row_ids_are_contiguous(self, manifest_bin: list[ManifestFile]) -> bool:
+        assigned = [
+            manifest
+            for manifest in manifest_bin
+            if manifest.content == ManifestContent.DATA and manifest.first_row_id is not None
+        ]
+        if len(assigned) <= 1:
+            return True
+
+        sorted_assigned = sorted(assigned, key=lambda manifest: manifest.first_row_id or 0)
+        # Merged manifests inherit the minimum row id and keep entry order, so the
+        # source manifests must already be in row-id order.
+        if assigned != sorted_assigned:
+            return False
+
+        cursor = sorted_assigned[0].first_row_id
+        if cursor is None:
+            return False
+
+        for manifest in sorted_assigned:
+            existing_rows_count = manifest.existing_rows_count
+            added_rows_count = manifest.added_rows_count
+            if existing_rows_count is None or added_rows_count is None:
+                return False
+            if manifest.first_row_id != cursor:
+                return False
+            cursor += existing_rows_count + added_rows_count
+
+        return True
 
     def _merge_group(self, first_manifest: ManifestFile, spec_id: int, manifests: list[ManifestFile]) -> list[ManifestFile]:
         packer: ListPacker[ManifestFile] = ListPacker(target_weight=self._target_size_bytes, lookback=1, largest_bin_first=False)
         bins: list[list[ManifestFile]] = packer.pack_end(manifests, lambda m: m.manifest_length)
+        format_version = self._snapshot_producer._transaction.table_metadata.format_version
 
         def merge_bin(manifest_bin: list[ManifestFile]) -> list[ManifestFile]:
             output_manifests = []
             if len(manifest_bin) == 1:
                 output_manifests.append(manifest_bin[0])
+            elif (
+                format_version >= 3
+                and first_manifest in manifest_bin
+                and first_manifest.content == ManifestContent.DATA
+                and first_manifest.first_row_id is None
+            ):
+                remaining_manifests = [manifest for manifest in manifest_bin if manifest != first_manifest]
+                output_manifests.append(first_manifest)
+                if len(remaining_manifests) == 1:
+                    output_manifests.append(remaining_manifests[0])
+                elif len(remaining_manifests) < self._min_count_to_merge:
+                    output_manifests.extend(remaining_manifests)
+                elif not self._v3_row_ids_are_contiguous(remaining_manifests):
+                    output_manifests.extend(remaining_manifests)
+                else:
+                    output_manifests.append(self._create_manifest(spec_id, remaining_manifests))
             elif first_manifest in manifest_bin and len(manifest_bin) < self._min_count_to_merge:
                 #  if the bin has the first manifest (the new data files or an appended manifest file) then only
                 #  merge it if the number of manifests is above the minimum count. this is applied only to bins
                 #  with an in-memory manifest so that large manifests don't prevent merging older groups.
+                output_manifests.extend(manifest_bin)
+            elif format_version >= 3 and not self._v3_row_ids_are_contiguous(manifest_bin):
                 output_manifests.extend(manifest_bin)
             else:
                 output_manifests.append(self._create_manifest(spec_id, manifest_bin))
