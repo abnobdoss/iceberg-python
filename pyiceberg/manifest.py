@@ -535,8 +535,10 @@ class DataFile(Record):
     def first_row_id(self) -> int | None:
         """The _row_id for the first row in the data file (field 142, v3+ only).
 
-        Older (v1/v2) DataFile structs do not carry this field, so we return
-        ``None`` when the underlying record is too short to hold it.
+        Note: ``DataFile.from_args`` always allocates the full v3-width record
+        (``len == 20``) regardless of table version, so a v1/v2 file simply holds
+        ``None`` at position 16. The length guard below only matters for records
+        constructed directly from a shorter positional list.
         """
         if len(self._data) > 16:
             return self._data[16]
@@ -545,7 +547,7 @@ class DataFile(Record):
     @first_row_id.setter
     def first_row_id(self, value: int | None) -> None:
         if len(self._data) <= 16:
-            raise ValueError("Cannot set first_row_id on a non-v3 DataFile (field 142 absent)")
+            raise ValueError("Cannot set first_row_id: record has no field-142 slot")
         self._data[16] = value
 
     # Spec ID should not be stored in the file
