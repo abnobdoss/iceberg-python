@@ -2974,10 +2974,11 @@ def _determine_partitions(spec: PartitionSpec, schema: Schema, arrow_table: pa.T
     partition_fields = [f"_partition_{field.name}" for field in spec.fields]
 
     for partition, name in zip(spec.fields, partition_fields, strict=True):
-        source_field = schema.find_field(partition.source_id)
-        full_field_name = schema.find_column_name(partition.source_id)
+        source_id = partition.single_source_id
+        source_field = schema.find_field(source_id)
+        full_field_name = schema.find_column_name(source_id)
         if full_field_name is None:
-            raise ValueError(f"Could not find column name for field ID: {partition.source_id}")
+            raise ValueError(f"Could not find column name for field ID: {source_id}")
         field_array = _get_field_from_arrow_table(arrow_table, full_field_name)
         arrow_table = arrow_table.append_column(name, partition.transform.pyarrow_transform(source_field.field_type)(field_array))
 

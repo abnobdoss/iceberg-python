@@ -64,7 +64,7 @@ class UpdateSpec(UpdateTableMetadata["UpdateSpec"]):
         self._name_to_field = {field.name: field for field in transaction.table_metadata.spec().fields}
         self._name_to_added_field = {}
         self._transform_to_field = {
-            (field.source_id, repr(field.transform)): field for field in transaction.table_metadata.spec().fields
+            (field.single_source_id, repr(field.transform)): field for field in transaction.table_metadata.spec().fields
         }
         self._transform_to_added_field = {}
         self._adds = []
@@ -104,10 +104,11 @@ class UpdateSpec(UpdateTableMetadata["UpdateSpec"]):
             raise ValueError(f"Already added partition field with name: {new_field.name}")
 
         if isinstance(new_field.transform, TimeTransform):
-            existing_time_field = self._added_time_fields.get(new_field.source_id)
+            source_id = new_field.single_source_id
+            existing_time_field = self._added_time_fields.get(source_id)
             if existing_time_field:
                 raise ValueError(f"Cannot add time partition field: {new_field.name} conflicts with {existing_time_field.name}")
-            self._added_time_fields[new_field.source_id] = new_field
+            self._added_time_fields[source_id] = new_field
         self._transform_to_added_field[transform_key] = new_field
 
         existing_partition_field = self._name_to_field.get(new_field.name)
@@ -199,18 +200,20 @@ class UpdateSpec(UpdateTableMetadata["UpdateSpec"]):
             if field.field_id not in self._deletes:
                 renamed = self._renames.get(field.name)
                 if renamed:
+                    source_id = field.single_source_id
                     new_field = _add_new_field(
                         self._transaction.table_metadata.schema(),
-                        field.source_id,
+                        source_id,
                         field.field_id,
                         renamed,
                         field.transform,
                         partition_names,
                     )
                 else:
+                    source_id = field.single_source_id
                     new_field = _add_new_field(
                         self._transaction.table_metadata.schema(),
-                        field.source_id,
+                        source_id,
                         field.field_id,
                         field.name,
                         field.transform,
@@ -220,18 +223,20 @@ class UpdateSpec(UpdateTableMetadata["UpdateSpec"]):
             elif self._transaction.table_metadata.format_version == 1:
                 renamed = self._renames.get(field.name)
                 if renamed:
+                    source_id = field.single_source_id
                     new_field = _add_new_field(
                         self._transaction.table_metadata.schema(),
-                        field.source_id,
+                        source_id,
                         field.field_id,
                         renamed,
                         VoidTransform(),
                         partition_names,
                     )
                 else:
+                    source_id = field.single_source_id
                     new_field = _add_new_field(
                         self._transaction.table_metadata.schema(),
-                        field.source_id,
+                        source_id,
                         field.field_id,
                         field.name,
                         VoidTransform(),
@@ -241,15 +246,16 @@ class UpdateSpec(UpdateTableMetadata["UpdateSpec"]):
                 partition_fields.append(new_field)
 
         for added_field in self._adds:
+            source_id = added_field.single_source_id
             _check_and_add_partition_name(
                 self._transaction.table_metadata.schema(),
                 added_field.name,
-                added_field.source_id,
+                source_id,
                 added_field.transform,
                 partition_names,
             )
             new_field = PartitionField(
-                source_id=added_field.source_id,
+                source_id=source_id,
                 field_id=added_field.field_id,
                 transform=added_field.transform,
                 name=added_field.name,
@@ -276,7 +282,7 @@ class UpdateSpec(UpdateTableMetadata["UpdateSpec"]):
                     historical_fields.append(field)
 
             for field in historical_fields:
-                if field.source_id == source_id and repr(field.transform) == repr(transform):
+                if field.single_source_id == source_id and repr(field.transform) == repr(transform):
                     if name is None or field.name == name:
                         return PartitionField(source_id, field.field_id, transform, field.name)
 

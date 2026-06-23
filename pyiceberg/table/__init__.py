@@ -366,7 +366,7 @@ class Transaction:
         Returns:
             A predicate matching any of the input partition records.
         """
-        partition_fields = [schema.find_field(field.source_id).name for field in spec.fields]
+        partition_fields = [schema.find_field(field.single_source_id).name for field in spec.fields]
         if not partition_records or not partition_fields:
             return AlwaysFalse()
 

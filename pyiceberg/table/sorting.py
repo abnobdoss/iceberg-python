@@ -24,6 +24,7 @@ from pydantic import (
     Field,
     PlainSerializer,
     WithJsonSchema,
+    model_serializer,
     model_validator,
 )
 
@@ -32,6 +33,10 @@ from pyiceberg.schema import Schema
 from pyiceberg.transforms import IdentityTransform, Transform, parse_transform
 from pyiceberg.typedef import IcebergBaseModel
 from pyiceberg.types import IcebergType
+
+MULTI_ARGUMENT_TRANSFORM_UNSUPPORTED = (
+    "Multi-argument transform evaluation is not yet supported (no concrete multi-arg transform is defined in the Iceberg spec)"
+)
 
 
 class SortDirection(Enum):
@@ -101,17 +106,21 @@ class SortField(IcebergBaseModel):
     @classmethod
     def map_source_ids_onto_source_id(cls, data: Any) -> Any:
         if isinstance(data, dict):
-            if "source-id" not in data and "source-ids" in data:
-                source_ids = data["source-ids"]
-                if isinstance(source_ids, list):
+            source_ids_key = "source-ids" if "source-ids" in data else "source_ids" if "source_ids" in data else None
+            if source_ids_key:
+                source_ids = data[source_ids_key]
+                if isinstance(source_ids, (list, tuple)):
                     if len(source_ids) == 0:
                         raise ValueError("Empty source-ids is not allowed")
-                    if len(source_ids) > 1:
-                        raise ValueError("Multi argument transforms are not yet supported")
-                    data["source-id"] = source_ids[0]
+                    if len(source_ids) == 1:
+                        data["source-id"] = source_ids[0]
+                    else:
+                        data.pop("source-id", None)
+                        data.pop("source_id", None)
         return data
 
-    source_id: int = Field(alias="source-id")
+    source_id: int | None = Field(alias="source-id", default=None)
+    source_ids: tuple[int, ...] | None = Field(alias="source-ids", default=None, repr=False)
     transform: Annotated[  # type: ignore
         Transform,
         BeforeValidator(parse_transform),
@@ -121,13 +130,65 @@ class SortField(IcebergBaseModel):
     direction: SortDirection = Field()
     null_order: NullOrder = Field(alias="null-order")
 
+    @model_validator(mode="after")
+    def validate_source_ids_present(self) -> "SortField":
+        if self.source_ids is not None and len(self.source_ids) == 0:
+            raise ValueError("Empty source-ids is not allowed")
+        if self.source_id is None and self.source_ids is None:
+            raise ValueError("source-id or source-ids must be present")
+        return self
+
+    @property
+    def source_ids_normalized(self) -> tuple[int, ...]:
+        if self.source_ids is not None and len(self.source_ids) > 1:
+            return self.source_ids
+        if self.source_id is not None:
+            return (self.source_id,)
+        return self.source_ids or ()
+
+    @property
+    def single_source_id(self) -> int:
+        ids = self.source_ids_normalized
+        if len(ids) != 1:
+            raise ValueError(MULTI_ARGUMENT_TRANSFORM_UNSUPPORTED)
+        return ids[0]
+
+    @model_serializer(mode="wrap")
+    def serialize_model(self, handler: Any) -> dict[str, Any]:
+        result = handler(self)
+        source_ids = self.source_ids_normalized
+        if len(source_ids) > 1:
+            result.pop("source-id", None)
+            result["source-ids"] = list(source_ids)
+        else:
+            result.pop("source-ids", None)
+            if source_ids:
+                result["source-id"] = source_ids[0]
+        return result
+
     def __str__(self) -> str:
         """Return the string representation of the SortField class."""
+        source_ids = ", ".join(str(source_id) for source_id in self.source_ids_normalized)
         if isinstance(self.transform, IdentityTransform):
             # In the case of an identity transform, we can omit the transform
-            return f"{self.source_id} {self.direction} {self.null_order}"
+            return f"{source_ids} {self.direction} {self.null_order}"
         else:
-            return f"{self.transform}({self.source_id}) {self.direction} {self.null_order}"
+            return f"{self.transform}({source_ids}) {self.direction} {self.null_order}"
+
+    def __eq__(self, other: Any) -> bool:
+        """Return the equality of two instances of the SortField class."""
+        if not isinstance(other, SortField):
+            return False
+        return (
+            self.source_ids_normalized == other.source_ids_normalized
+            and self.transform == other.transform
+            and self.direction == other.direction
+            and self.null_order == other.null_order
+        )
+
+    def __hash__(self) -> int:
+        """Return a hash consistent with SortField equality."""
+        return hash((self.source_ids_normalized, self.transform, self.direction, self.null_order))
 
 
 INITIAL_SORT_ORDER_ID = 1
@@ -174,16 +235,17 @@ class SortOrder(IcebergBaseModel):
 
     def check_compatible(self, schema: Schema) -> None:
         for field in self.fields:
-            source_field = schema._lazy_id_to_field.get(field.source_id)
-            if source_field is None:
-                raise ValidationError(f"Cannot find source column for sort field: {field}")
-            if not source_field.field_type.is_primitive:
-                raise ValidationError(f"Cannot sort by non-primitive source field: {source_field}")
-            if not field.transform.can_transform(source_field.field_type):
-                raise ValidationError(
-                    f"Invalid source field {source_field.name} with type {source_field.field_type} "
-                    + f"for transform: {field.transform}"
-                )
+            for source_id in field.source_ids_normalized:
+                source_field = schema._lazy_id_to_field.get(source_id)
+                if source_field is None:
+                    raise ValidationError(f"Cannot find source column for sort field: {field}")
+                if not source_field.field_type.is_primitive:
+                    raise ValidationError(f"Cannot sort by non-primitive source field: {source_field}")
+                if not field.transform.can_transform(source_field.field_type):
+                    raise ValidationError(
+                        f"Invalid source field {source_field.name} with type {source_field.field_type} "
+                        + f"for transform: {field.transform}"
+                    )
 
 
 UNSORTED_SORT_ORDER_ID = 0
@@ -198,7 +260,8 @@ def assign_fresh_sort_order_ids(
 
     fresh_fields = []
     for field in sort_order.fields:
-        original_field = old_schema.find_column_name(field.source_id)
+        source_id = field.single_source_id
+        original_field = old_schema.find_column_name(source_id)
         if original_field is None:
             raise ValueError(f"Could not find in old schema: {field}")
         fresh_field = fresh_schema.find_field(original_field)

@@ -668,7 +668,7 @@ class UpdateSchema(UpdateTableMetadata["UpdateSchema"]):
         for spec in self._transaction.table_metadata.partition_specs:
             for partition_field in spec.fields:
                 validate_partition_name(
-                    partition_field.name, partition_field.transform, partition_field.source_id, new_schema, set()
+                    partition_field.name, partition_field.transform, partition_field.single_source_id, new_schema, set()
                 )
         field_ids = set()
         for name in self._identifier_field_names:

@@ -287,7 +287,7 @@ class TableMetadataCommonFields(IcebergBaseModel):
         # Sort them by field_id in order to get a deterministic output
         for field_id in sorted(struct_fields):
             field = struct_fields[field_id]
-            source_type = schema.find_type(field.source_id)
+            source_type = schema.find_type(field.single_source_id)
             result_type = field.transform.result_type(source_type)
             nested_fields.append(NestedField(field_id=field.field_id, name=field.name, type=result_type, required=False))
 

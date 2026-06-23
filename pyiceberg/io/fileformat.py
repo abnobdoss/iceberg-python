@@ -46,10 +46,11 @@ class DataFileStatistics:
     split_offsets: list[int]
 
     def _partition_value(self, partition_field: PartitionField, schema: Schema) -> Any:
-        if partition_field.source_id not in self.column_aggregates:
+        source_id = partition_field.single_source_id
+        if source_id not in self.column_aggregates:
             return None
 
-        source_field = schema.find_field(partition_field.source_id)
+        source_field = schema.find_field(source_id)
         iceberg_transform = partition_field.transform
 
         if not iceberg_transform.preserves_order:
@@ -63,14 +64,14 @@ class DataFileStatistics:
         lower_value = transform_func(
             partition_record_value(
                 partition_field=partition_field,
-                value=self.column_aggregates[partition_field.source_id].current_min,
+                value=self.column_aggregates[source_id].current_min,
                 schema=schema,
             )
         )
         upper_value = transform_func(
             partition_record_value(
                 partition_field=partition_field,
-                value=self.column_aggregates[partition_field.source_id].current_max,
+                value=self.column_aggregates[source_id].current_max,
                 schema=schema,
             )
         )

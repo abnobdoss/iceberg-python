@@ -168,6 +168,9 @@ class Transform(IcebergRootModel[str], ABC, Generic[S, T]):
     @abstractmethod
     def transform(self, source: IcebergType) -> Callable[[S | None], T | None]: ...
 
+    def transform_multi(self, source_types: list[IcebergType]) -> Callable[[list[Any]], T | None]:
+        raise NotImplementedError("This transform does not support multiple arguments")
+
     @abstractmethod
     def can_transform(self, source: IcebergType) -> bool:
         return False

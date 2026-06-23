@@ -29,6 +29,7 @@ from pydantic import (
     Field,
     PlainSerializer,
     WithJsonSchema,
+    model_serializer,
     model_validator,
 )
 
@@ -64,6 +65,9 @@ from pyiceberg.utils.datetime import date_to_days, datetime_to_micros, time_to_m
 
 INITIAL_PARTITION_SPEC_ID = 0
 PARTITION_FIELD_ID_START: int = 1000
+MULTI_ARGUMENT_TRANSFORM_UNSUPPORTED = (
+    "Multi-argument transform evaluation is not yet supported (no concrete multi-arg transform is defined in the Iceberg spec)"
+)
 
 
 class PartitionField(IcebergBaseModel):
@@ -76,7 +80,8 @@ class PartitionField(IcebergBaseModel):
         name(str): The name of this partition field.
     """
 
-    source_id: int = Field(alias="source-id")
+    source_id: int | None = Field(alias="source-id", default=None)
+    source_ids: tuple[int, ...] | None = Field(alias="source-ids", default=None, repr=False)
     field_id: int = Field(alias="field-id")
     transform: Annotated[  # type: ignore
         Transform,
@@ -109,19 +114,74 @@ class PartitionField(IcebergBaseModel):
     @classmethod
     def map_source_ids_onto_source_id(cls, data: Any) -> Any:
         if isinstance(data, dict):
-            if "source-id" not in data and "source-ids" in data:
-                source_ids = data["source-ids"]
-                if isinstance(source_ids, list):
+            source_ids_key = "source-ids" if "source-ids" in data else "source_ids" if "source_ids" in data else None
+            if source_ids_key:
+                source_ids = data[source_ids_key]
+                if isinstance(source_ids, (list, tuple)):
                     if len(source_ids) == 0:
                         raise ValueError("Empty source-ids is not allowed")
-                    if len(source_ids) > 1:
-                        raise ValueError("Multi argument transforms are not yet supported")
-                    data["source-id"] = source_ids[0]
+                    if len(source_ids) == 1:
+                        data["source-id"] = source_ids[0]
+                    else:
+                        data.pop("source-id", None)
+                        data.pop("source_id", None)
         return data
+
+    @model_validator(mode="after")
+    def validate_source_ids_present(self) -> PartitionField:
+        if self.source_ids is not None and len(self.source_ids) == 0:
+            raise ValueError("Empty source-ids is not allowed")
+        if self.source_id is None and self.source_ids is None:
+            raise ValueError("source-id or source-ids must be present")
+        return self
+
+    @property
+    def source_ids_normalized(self) -> tuple[int, ...]:
+        if self.source_ids is not None and len(self.source_ids) > 1:
+            return self.source_ids
+        if self.source_id is not None:
+            return (self.source_id,)
+        return self.source_ids or ()
+
+    @property
+    def single_source_id(self) -> int:
+        ids = self.source_ids_normalized
+        if len(ids) != 1:
+            raise ValueError(MULTI_ARGUMENT_TRANSFORM_UNSUPPORTED)
+        return ids[0]
+
+    @model_serializer(mode="wrap")
+    def serialize_model(self, handler: Any) -> dict[str, Any]:
+        result = handler(self)
+        source_ids = self.source_ids_normalized
+        if len(source_ids) > 1:
+            result.pop("source-id", None)
+            result["source-ids"] = list(source_ids)
+        else:
+            result.pop("source-ids", None)
+            if source_ids:
+                result["source-id"] = source_ids[0]
+        return result
 
     def __str__(self) -> str:
         """Return the string representation of the PartitionField class."""
-        return f"{self.field_id}: {self.name}: {self.transform}({self.source_id})"
+        source_ids = ", ".join(str(source_id) for source_id in self.source_ids_normalized)
+        return f"{self.field_id}: {self.name}: {self.transform}({source_ids})"
+
+    def __eq__(self, other: Any) -> bool:
+        """Return the equality of two instances of the PartitionField class."""
+        if not isinstance(other, PartitionField):
+            return False
+        return (
+            self.source_ids_normalized == other.source_ids_normalized
+            and self.field_id == other.field_id
+            and self.transform == other.transform
+            and self.name == other.name
+        )
+
+    def __hash__(self) -> int:
+        """Return a hash consistent with PartitionField equality."""
+        return hash((self.source_ids_normalized, self.field_id, self.transform, self.name))
 
 
 class PartitionSpec(IcebergBaseModel):
@@ -187,9 +247,10 @@ class PartitionSpec(IcebergBaseModel):
     def source_id_to_fields_map(self) -> dict[int, list[PartitionField]]:
         source_id_to_fields_map: dict[int, list[PartitionField]] = {}
         for partition_field in self.fields:
-            existing = source_id_to_fields_map.get(partition_field.source_id, [])
-            existing.append(partition_field)
-            source_id_to_fields_map[partition_field.source_id] = existing
+            for source_id in partition_field.source_ids_normalized:
+                existing = source_id_to_fields_map.get(source_id, [])
+                existing.append(partition_field)
+                source_id_to_fields_map[source_id] = existing
         return source_id_to_fields_map
 
     def fields_by_source_id(self, field_id: int) -> list[PartitionField]:
@@ -202,7 +263,7 @@ class PartitionSpec(IcebergBaseModel):
         if len(self.fields) != len(other.fields):
             return False
         return all(
-            this_field.source_id == that_field.source_id
+            this_field.source_ids_normalized == that_field.source_ids_normalized
             and this_field.transform == that_field.transform
             and this_field.name == that_field.name
             for this_field, that_field in zip(self.fields, other.fields, strict=True)
@@ -227,7 +288,8 @@ class PartitionSpec(IcebergBaseModel):
         nested_fields = []
         schema_ids = schema._lazy_id_to_field
         for field in self.fields:
-            if source_field := schema_ids.get(field.source_id):
+            source_id = field.single_source_id
+            if source_field := schema_ids.get(source_id):
                 result_type = field.transform.result_type(source_field.field_type)
                 nested_fields.append(NestedField(field.field_id, field.name, result_type, required=source_field.required))
             else:
@@ -257,32 +319,38 @@ class PartitionSpec(IcebergBaseModel):
         parents = schema._lazy_id_to_parent
 
         for field in self.fields:
-            source_field = schema_fields.get(field.source_id)
+            source_fields = []
+            for source_id in field.source_ids_normalized:
+                source_field = schema_fields.get(source_id)
 
-            if allow_missing_fields and source_field is None:
+                if allow_missing_fields and source_field is None:
+                    continue
+
+                if isinstance(field.transform, VoidTransform):
+                    continue
+
+                if not source_field:
+                    raise ValidationError(f"Cannot find source column for partition field: {field}")
+
+                source_type = source_field.field_type
+                if not source_type.is_primitive:
+                    raise ValidationError(f"Cannot partition by non-primitive source field: {source_field}")
+                if not field.transform.can_transform(source_type):
+                    raise ValidationError(
+                        f"Invalid source field {source_field.name} with type {source_type} " + f"for transform: {field.transform}"
+                    )
+                source_fields.append(source_field)
+
+                # The only valid parent types for a PartitionField are StructTypes. This must be checked recursively
+                parent_id = parents.get(source_id)
+                while parent_id:
+                    parent_type = schema.find_type(parent_id)
+                    if not parent_type.is_struct:
+                        raise ValidationError(f"Invalid partition field parent: {parent_type}")
+                    parent_id = parents.get(parent_id)
+
+            if not source_fields:
                 continue
-
-            if isinstance(field.transform, VoidTransform):
-                continue
-
-            if not source_field:
-                raise ValidationError(f"Cannot find source column for partition field: {field}")
-
-            source_type = source_field.field_type
-            if not source_type.is_primitive:
-                raise ValidationError(f"Cannot partition by non-primitive source field: {source_field}")
-            if not field.transform.can_transform(source_type):
-                raise ValidationError(
-                    f"Invalid source field {source_field.name} with type {source_type} " + f"for transform: {field.transform}"
-                )
-
-            # The only valid parent types for a PartitionField are StructTypes. This must be checked recursively
-            parent_id = parents.get(field.source_id)
-            while parent_id:
-                parent_type = schema.find_type(parent_id)
-                if not parent_type.is_struct:
-                    raise ValidationError(f"Invalid partition field parent: {parent_type}")
-                parent_id = parents.get(parent_id)
 
 
 UNPARTITIONED_PARTITION_SPEC = PartitionSpec(spec_id=0)
@@ -316,7 +384,8 @@ def validate_partition_name(
 def assign_fresh_partition_spec_ids(spec: PartitionSpec, old_schema: Schema, fresh_schema: Schema) -> PartitionSpec:
     partition_fields = []
     for pos, field in enumerate(spec.fields):
-        original_column_name = old_schema.find_column_name(field.source_id)
+        source_id = field.single_source_id
+        original_column_name = old_schema.find_column_name(source_id)
         if original_column_name is None:
             raise ValueError(f"Could not find in old schema: {field}")
         fresh_field = fresh_schema.find_field(original_column_name)
@@ -416,29 +485,30 @@ def _visit(spec: PartitionSpec, schema: Schema, visitor: PartitionSpecVisitor[R]
 
 
 def _visit_partition_field(schema: Schema, field: PartitionField, visitor: PartitionSpecVisitor[R]) -> R:
-    source_name = schema.find_column_name(field.source_id)
+    source_id = field.single_source_id
+    source_name = schema.find_column_name(source_id)
     if not source_name:
-        raise ValueError(f"Could not find field with id {field.source_id}")
+        raise ValueError(f"Could not find field with id {source_id}")
 
     transform = field.transform
     if isinstance(transform, IdentityTransform):
-        return visitor.identity(field.field_id, source_name, field.source_id)
+        return visitor.identity(field.field_id, source_name, source_id)
     elif isinstance(transform, BucketTransform):
-        return visitor.bucket(field.field_id, source_name, field.source_id, transform.num_buckets)
+        return visitor.bucket(field.field_id, source_name, source_id, transform.num_buckets)
     elif isinstance(transform, TruncateTransform):
-        return visitor.truncate(field.field_id, source_name, field.source_id, transform.width)
+        return visitor.truncate(field.field_id, source_name, source_id, transform.width)
     elif isinstance(transform, DayTransform):
-        return visitor.day(field.field_id, source_name, field.source_id)
+        return visitor.day(field.field_id, source_name, source_id)
     elif isinstance(transform, HourTransform):
-        return visitor.hour(field.field_id, source_name, field.source_id)
+        return visitor.hour(field.field_id, source_name, source_id)
     elif isinstance(transform, MonthTransform):
-        return visitor.month(field.field_id, source_name, field.source_id)
+        return visitor.month(field.field_id, source_name, source_id)
     elif isinstance(transform, YearTransform):
-        return visitor.year(field.field_id, source_name, field.source_id)
+        return visitor.year(field.field_id, source_name, source_id)
     elif isinstance(transform, VoidTransform):
-        return visitor.always_null(field.field_id, source_name, field.source_id)
+        return visitor.always_null(field.field_id, source_name, source_id)
     elif isinstance(transform, UnknownTransform):
-        return visitor.unknown(field.field_id, source_name, field.source_id, repr(transform))
+        return visitor.unknown(field.field_id, source_name, source_id, repr(transform))
     else:
         raise ValueError(f"Unknown transform {transform}")
 
@@ -459,7 +529,8 @@ class PartitionKey:
     def partition(self) -> Record:  # partition key transformed with iceberg internal representation as input
         iceberg_typed_key_values = []
         for raw_partition_field_value in self.field_values:
-            partition_fields = self.partition_spec.source_id_to_fields_map[raw_partition_field_value.field.source_id]
+            source_id = raw_partition_field_value.field.single_source_id
+            partition_fields = self.partition_spec.source_id_to_fields_map[source_id]
             if len(partition_fields) != 1:
                 raise ValueError(f"Cannot have redundant partitions: {partition_fields}")
             partition_field = partition_fields[0]
@@ -486,7 +557,7 @@ def partition_record_value(partition_field: PartitionField, value: Any, schema: 
     Then the corresponding PartitionField's transform is applied to return
     the final partition record value.
     """
-    iceberg_type = schema.find_field(name_or_id=partition_field.source_id).field_type
+    iceberg_type = schema.find_field(name_or_id=partition_field.single_source_id).field_type
     return _to_partition_representation(iceberg_type, value)
 
 
