@@ -288,6 +288,47 @@ def test_table_scan_ref(table_v2: Table) -> None:
     assert scan.use_ref("test").snapshot_id == 3051729675574597004
 
 
+def test_table_scan_branch_keyword(table_v2: Table) -> None:
+    table_v2.metadata = table_v2.metadata.model_copy(
+        update={
+            "refs": {
+                **table_v2.metadata.refs,
+                "test-branch": SnapshotRef(snapshot_id=3055729675574597004, snapshot_ref_type=SnapshotRefType.BRANCH),
+            }
+        }
+    )
+
+    scan = table_v2.scan(branch="test-branch")
+
+    assert scan.snapshot_id == 3055729675574597004
+
+
+def test_table_scan_tag_keyword(table_v2: Table) -> None:
+    scan = table_v2.scan(tag="test")
+
+    assert scan.snapshot_id == 3051729675574597004
+
+
+def test_table_scan_branch_and_tag_raises(table_v2: Table) -> None:
+    with pytest.raises(ValueError, match="Cannot specify more than one of snapshot_id, branch, and tag"):
+        table_v2.scan(branch="test-branch", tag="test")
+
+
+def test_table_scan_snapshot_id_and_branch_raises(table_v2: Table) -> None:
+    with pytest.raises(ValueError, match="Cannot specify more than one of snapshot_id, branch, and tag"):
+        table_v2.scan(snapshot_id=3051729675574597004, branch="test-branch")
+
+
+def test_table_scan_unknown_branch_raises(table_v2: Table) -> None:
+    with pytest.raises(ValueError, match="Cannot scan unknown branch=does-not-exist"):
+        table_v2.scan(branch="does-not-exist")
+
+
+def test_table_scan_branch_with_tag_ref_raises(table_v2: Table) -> None:
+    with pytest.raises(ValueError, match="Ref test is not a branch"):
+        table_v2.scan(branch="test")
+
+
 def test_table_scan_ref_does_not_exists(table_v2: Table) -> None:
     scan = table_v2.scan()
 

@@ -1053,7 +1053,7 @@ class ExpireSnapshots(UpdateTableMetadata["ExpireSnapshots"]):
         """
         Commit the staged updates and requirements.
 
-        This will remove the snapshots with the given IDs, but will always skip protected snapshots (branch/tag heads).
+        This will remove the snapshots with the given IDs, but will always skip protected snapshots.
 
         Returns:
             Tuple of updates and requirements to be committed,
@@ -1087,16 +1087,22 @@ class ExpireSnapshots(UpdateTableMetadata["ExpireSnapshots"]):
         """
         Get the IDs of protected snapshots.
 
-        These are the HEAD snapshots of all branches and all tagged snapshots.  These ids are to be excluded from expiration.
+        These are the HEAD snapshots of all branches, all tagged snapshots, and the current snapshot. These ids are to be
+        excluded from expiration.
 
         Returns:
             Set of protected snapshot IDs to exclude from expiration.
         """
-        return {
+        table_metadata = self._transaction.table_metadata
+        protected_ids = {
             ref.snapshot_id
-            for ref in self._transaction.table_metadata.refs.values()
+            for ref in table_metadata.refs.values()
             if ref.snapshot_ref_type in [SnapshotRefType.TAG, SnapshotRefType.BRANCH]
         }
+        if table_metadata.current_snapshot_id is not None:
+            protected_ids.add(table_metadata.current_snapshot_id)
+
+        return protected_ids
 
     def by_id(self, snapshot_id: int) -> ExpireSnapshots:
         """
@@ -1153,11 +1159,16 @@ class ExpireSnapshots(UpdateTableMetadata["ExpireSnapshots"]):
 
     def retain_last(self, num_snapshots: int) -> ExpireSnapshots:
         """
-        Keep at least the N most-recent unprotected snapshots.
+        Retain the N most-recent unprotected snapshots.
 
-        This is a retention floor: snapshots selected by other expiration rules, such as older_than,
-        are kept if they are among the N newest unprotected snapshots by timestamp. Protected
-        snapshots, such as branch or tag heads, are always kept and are not counted toward N.
+        Used alone, this expires all unprotected snapshots except the N most-recent by timestamp.
+        When combined with other expiration rules, such as older_than, this also acts as a
+        retention floor: the N most-recent unprotected snapshots are kept even if another rule
+        selected them for expiration. Protected snapshots, such as branch or tag heads and the
+        current snapshot, are always kept and are not counted toward N.
+
+        Retention is computed globally by snapshot timestamp, not per-branch ancestry; this differs
+        from the Java reference for non-linear histories and is a known limitation shared with older_than().
 
         Args:
             num_snapshots (int): Number of newest unprotected snapshots to retain.

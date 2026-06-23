@@ -77,6 +77,29 @@ def test_cannot_expire_tagged_snapshot(table_v2: Table) -> None:
     table_v2.catalog.commit_table.assert_not_called()
 
 
+def test_cannot_expire_current_snapshot_without_ref(table_v2: Table) -> None:
+    current_snapshot_id = table_v2.metadata.current_snapshot_id
+    assert current_snapshot_id is not None
+    non_current_snapshot_id = next(
+        snapshot.snapshot_id for snapshot in table_v2.metadata.snapshots if snapshot.snapshot_id != current_snapshot_id
+    )
+
+    table_v2.catalog = MagicMock()
+    table_v2.metadata = table_v2.metadata.model_copy(
+        update={
+            "refs": {
+                "main": SnapshotRef(snapshot_id=non_current_snapshot_id, snapshot_ref_type=SnapshotRefType.BRANCH),
+            }
+        }
+    )
+    assert all(ref.snapshot_id != current_snapshot_id for ref in table_v2.metadata.refs.values())
+
+    with pytest.raises(ValueError, match=f"Snapshot with ID {current_snapshot_id} is protected and cannot be expired."):
+        table_v2.maintenance.expire_snapshots().by_id(current_snapshot_id).commit()
+
+    table_v2.catalog.commit_table.assert_not_called()
+
+
 def test_expire_unprotected_snapshot(table_v2: Table) -> None:
     """Test that an unprotected snapshot can be expired."""
     EXPIRE_SNAPSHOT = 3051729675574597004
@@ -404,6 +427,33 @@ def test_retain_last_one_keeps_only_newest_unprotected_snapshot(table_v2: Table)
 
     remaining_ids = {snapshot.snapshot_id for snapshot in table_v2.metadata.snapshots}
     assert remaining_ids == {103}
+
+
+def test_retain_last_keeps_current_snapshot_without_counting_it(table_v2: Table) -> None:
+    _prepare_table_with_snapshots(
+        table_v2,
+        [
+            (101, 1000),
+            (102, 2000),
+            (103, 3000),
+            (104, 4000),
+        ],
+        refs={
+            "main": SnapshotRef(snapshot_id=104, snapshot_ref_type=SnapshotRefType.BRANCH),
+        },
+        current_snapshot_id=101,
+    )
+    _configure_commit_to_apply_updates(table_v2)
+    assert all(ref.snapshot_id != 101 for ref in table_v2.metadata.refs.values())
+
+    table_v2.maintenance.expire_snapshots().retain_last(1).commit()
+
+    remaining_ids = {snapshot.snapshot_id for snapshot in table_v2.metadata.snapshots}
+    assert remaining_ids == {101, 103, 104}
+    assert table_v2.metadata.current_snapshot_id == 101
+    current_snapshot = table_v2.current_snapshot()
+    assert current_snapshot is not None
+    assert current_snapshot.snapshot_id == 101
 
 
 def test_older_than_with_retain_last_keeps_newest_unprotected_floor(table_v2: Table) -> None:
