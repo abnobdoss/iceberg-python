@@ -1200,7 +1200,9 @@ def _equality_delete_key_names(
     return data_names, delete_names
 
 
-def _equality_delete_key_table(delete_table: pa.Table, data_table: pa.Table, data_names: list[str], delete_names: list[str]) -> pa.Table:
+def _equality_delete_key_table(
+    delete_table: pa.Table, data_table: pa.Table, data_names: list[str], delete_names: list[str]
+) -> pa.Table:
     arrays: list[pa.ChunkedArray] = []
     for data_name, delete_name in zip(data_names, delete_names, strict=True):
         column = delete_table.column(delete_name)
@@ -1836,7 +1838,9 @@ def _task_to_record_batches(
             )
 
 
-def _read_all_delete_files(io: FileIO, tasks: Iterable[FileScanTask]) -> tuple[dict[str, list[ChunkedArray]], dict[str, pa.Table]]:
+def _read_all_delete_files(
+    io: FileIO, tasks: Iterable[FileScanTask]
+) -> tuple[dict[str, list[ChunkedArray]], dict[str, pa.Table]]:
     tasks = list(tasks)
     deletes_per_file: dict[str, list[ChunkedArray]] = {}
     equality_deletes_per_file: dict[str, pa.Table] = {}
