@@ -1865,6 +1865,134 @@ baz: [[true,null]]"""
     assert str(with_deletes) == expected_str
 
 
+def _scan_with_equality_delete(
+    tmp_path: Path,
+    schema: Schema,
+    data_rows: list[dict[str, Any]],
+    equality_ids: list[int],
+    delete_rows: list[dict[str, Any]],
+    delete_key_fields: list[tuple[str, pa.DataType, int]],
+) -> pa.Table:
+    data_schema = schema_to_pyarrow(schema, metadata={ICEBERG_SCHEMA: bytes(schema.model_dump_json(), UTF8)})
+    data_table = pa.Table.from_pylist(data_rows, schema=data_schema)
+    data_file_path = str(tmp_path / "data.parquet")
+    _write_table_to_file(data_file_path, data_schema, data_table)
+
+    data_file = DataFile.from_args(
+        content=DataFileContent.DATA,
+        file_path=data_file_path,
+        file_format=FileFormat.PARQUET,
+        partition={},
+        record_count=data_table.num_rows,
+        file_size_in_bytes=os.path.getsize(data_file_path),
+    )
+    data_file.spec_id = 0
+
+    delete_schema = pa.schema(
+        [
+            pa.field(name, field_type, metadata={PYARROW_PARQUET_FIELD_ID_KEY: bytes(str(field_id), UTF8)})
+            for name, field_type, field_id in delete_key_fields
+        ]
+    )
+    delete_table = pa.Table.from_pylist(delete_rows, schema=delete_schema)
+    delete_file_path = str(tmp_path / "eq-delete.parquet")
+    _write_table_to_file(delete_file_path, delete_schema, delete_table)
+
+    delete_file = DataFile.from_args(
+        content=DataFileContent.EQUALITY_DELETES,
+        file_path=delete_file_path,
+        file_format=FileFormat.PARQUET,
+        partition={},
+        record_count=delete_table.num_rows,
+        file_size_in_bytes=os.path.getsize(delete_file_path),
+        equality_ids=equality_ids,
+    )
+    delete_file.spec_id = 0
+
+    task = FileScanTask(data_file=data_file, delete_files={delete_file})
+    return ArrowScan(
+        table_metadata=TableMetadataV2(
+            location=f"file://{tmp_path}",
+            last_column_id=max(schema.field_ids),
+            format_version=2,
+            current_schema_id=schema.schema_id,
+            schemas=[schema],
+            partition_specs=[PartitionSpec()],
+        ),
+        io=load_file_io(),
+        projected_schema=schema,
+        row_filter=AlwaysTrue(),
+    ).to_table([task])
+
+
+def test_equality_delete_single_column(tmp_path: Path) -> None:
+    schema = Schema(NestedField(1, "id", IntegerType(), required=True))
+
+    result = _scan_with_equality_delete(
+        tmp_path=tmp_path,
+        schema=schema,
+        data_rows=[{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}],
+        equality_ids=[1],
+        delete_rows=[{"id": 2}, {"id": 4}],
+        delete_key_fields=[("id", pa.int32(), 1)],
+    )
+
+    assert result.column("id").to_pylist() == [1, 3]
+
+
+def test_equality_delete_multi_column(tmp_path: Path) -> None:
+    schema = Schema(
+        NestedField(1, "id", IntegerType(), required=True),
+        NestedField(2, "region", StringType(), required=True),
+        NestedField(3, "val", StringType(), required=True),
+    )
+
+    result = _scan_with_equality_delete(
+        tmp_path=tmp_path,
+        schema=schema,
+        data_rows=[
+            {"id": 1, "region": "us", "val": "drop"},
+            {"id": 1, "region": "eu", "val": "keep-eu"},
+            {"id": 2, "region": "us", "val": "keep-us"},
+        ],
+        equality_ids=[1, 2],
+        delete_rows=[{"id": 1, "region": "us"}],
+        delete_key_fields=[("id", pa.int32(), 1), ("region", pa.string(), 2)],
+    )
+
+    assert result.to_pydict() == {"id": [1, 2], "region": ["eu", "us"], "val": ["keep-eu", "keep-us"]}
+
+
+def test_equality_delete_no_match(tmp_path: Path) -> None:
+    schema = Schema(NestedField(1, "id", IntegerType(), required=True))
+
+    result = _scan_with_equality_delete(
+        tmp_path=tmp_path,
+        schema=schema,
+        data_rows=[{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}],
+        equality_ids=[1],
+        delete_rows=[{"id": 5}],
+        delete_key_fields=[("id", pa.int32(), 1)],
+    )
+
+    assert result.column("id").to_pylist() == [1, 2, 3, 4]
+
+
+def test_equality_delete_null_key(tmp_path: Path) -> None:
+    schema = Schema(NestedField(1, "id", IntegerType(), required=False))
+
+    result = _scan_with_equality_delete(
+        tmp_path=tmp_path,
+        schema=schema,
+        data_rows=[{"id": 1}, {"id": None}, {"id": 3}],
+        equality_ids=[1],
+        delete_rows=[{"id": None}],
+        delete_key_fields=[("id", pa.int32(), 1)],
+    )
+
+    assert result.column("id").to_pylist() == [1, 3]
+
+
 def test_delete_duplicates(deletes_file: str, request: pytest.FixtureRequest, table_schema_simple: Schema) -> None:
     # Determine file format from the file extension
     file_format = FileFormat.PARQUET if deletes_file.endswith(".parquet") else FileFormat.ORC
