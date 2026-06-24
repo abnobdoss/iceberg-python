@@ -25,6 +25,8 @@ import pyarrow as pa
 import pytest
 
 from pyiceberg.catalog.sql import SqlCatalog
+from pyiceberg.io import FileIO
+from pyiceberg.manifest import ManifestFile
 from pyiceberg.table import CommitTableResponse, Table, Transaction
 from pyiceberg.table.snapshots import Snapshot
 from pyiceberg.table.statistics import BlobMetadata, PartitionStatisticsFile, StatisticsFile
@@ -244,10 +246,10 @@ def test_expire_snapshots_clean_skips_deletion_when_surviving_unresolvable(tmp_p
     assert current_snapshot is not None
     original_manifests = Snapshot.manifests
 
-    def manifests(snapshot: Snapshot, *args: object, **kwargs: object) -> object:
+    def manifests(snapshot: Snapshot, io: FileIO) -> list[ManifestFile]:
         if snapshot.snapshot_id == current_snapshot.snapshot_id:
             raise OSError("surviving manifest list is unavailable")
-        return original_manifests(snapshot, *args, **kwargs)
+        return original_manifests(snapshot, io)
 
     with (
         patch.object(table.io, "delete", wraps=table.io.delete) as delete,
