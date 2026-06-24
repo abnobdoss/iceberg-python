@@ -151,8 +151,8 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         return self
 
     def append_delete_file(self, delete_file: DataFile) -> _SnapshotProducer[U]:
-        if delete_file.content not in (DataFileContent.POSITION_DELETES, DataFileContent.EQUALITY_DELETES):
-            raise ValueError(f"append_delete_file requires a delete file, got {delete_file.content}")
+        if delete_file.content != DataFileContent.POSITION_DELETES:
+            raise ValueError(f"append_delete_file requires a position-delete file, got {delete_file.content}")
         self._added_delete_files.append(delete_file)
         return self
 

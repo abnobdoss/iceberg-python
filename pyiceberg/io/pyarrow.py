@@ -2703,6 +2703,8 @@ def write_position_delete_file(
     spec_id copied from the referenced data file so it is partition-scoped, and record_count
     equal to the number of deleted positions.
     """
+    if table_metadata.format_version < 2:
+        raise ValueError(f"Position deletes are only supported for v2+ tables, got v{table_metadata.format_version}")
     if referenced_data_file.content != DataFileContent.DATA:
         raise ValueError(f"referenced_data_file must be a DATA file, got {referenced_data_file.content}")
 
@@ -2728,8 +2730,8 @@ def write_position_delete_file(
     )
     arrow_schema = pa.schema(
         [
-            pa.field("file_path", pa.string(), metadata={PYARROW_PARQUET_FIELD_ID_KEY: b"2147483546"}),
-            pa.field("pos", pa.int64(), metadata={PYARROW_PARQUET_FIELD_ID_KEY: b"2147483545"}),
+            pa.field("file_path", pa.string(), nullable=False, metadata={PYARROW_PARQUET_FIELD_ID_KEY: b"2147483546"}),
+            pa.field("pos", pa.int64(), nullable=False, metadata={PYARROW_PARQUET_FIELD_ID_KEY: b"2147483545"}),
         ]
     )
     arrow_table = pa.Table.from_arrays(
