@@ -150,12 +150,6 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         self._added_data_files.append(data_file)
         return self
 
-    def append_delete_file(self, delete_file: DataFile) -> _SnapshotProducer[U]:
-        if delete_file.content != DataFileContent.POSITION_DELETES:
-            raise ValueError(f"append_delete_file requires a position-delete file, got {delete_file.content}")
-        self._added_delete_files.append(delete_file)
-        return self
-
     def delete_data_file(self, data_file: DataFile) -> _SnapshotProducer[U]:
         self._deleted_data_files.add(data_file)
         return self
@@ -578,6 +572,12 @@ class _RowDeltaFiles(_SnapshotProducer["_RowDeltaFiles"]):
     positional-delete reader applies the new delete files. Delete-file sequence numbers are left
     unassigned and stamped at commit, so delete seq == data seq == snapshot seq (a true row delta).
     """
+
+    def append_delete_file(self, delete_file: DataFile) -> _RowDeltaFiles:
+        if delete_file.content != DataFileContent.POSITION_DELETES:
+            raise ValueError(f"append_delete_file requires a position-delete file, got {delete_file.content}")
+        self._added_delete_files.append(delete_file)
+        return self
 
     def _existing_manifests(self) -> list[ManifestFile]:
         """Carry forward all existing manifests from the parent snapshot, like _FastAppendFiles."""
