@@ -34,16 +34,18 @@ def test_geospatial_stats_aggregator_accumulates_planar_bounds() -> None:
     aggregator.add(_point_wkb(10.0, -3.0))
     aggregator.add(_linestring_xyzm_wkb([(-2.0, 4.0, 7.0, 3.0), (6.0, 9.0, 2.0, 8.0)]))
 
-    assert aggregator.min_bound() is not None
-    assert aggregator.max_bound() is not None
-    assert aggregator.min_bound().x == -2.0
-    assert aggregator.min_bound().y == -3.0
-    assert aggregator.min_bound().z == 2.0
-    assert aggregator.min_bound().m == 3.0
-    assert aggregator.max_bound().x == 10.0
-    assert aggregator.max_bound().y == 9.0
-    assert aggregator.max_bound().z == 7.0
-    assert aggregator.max_bound().m == 8.0
+    min_bound = aggregator.min_bound()
+    max_bound = aggregator.max_bound()
+    assert min_bound is not None
+    assert max_bound is not None
+    assert min_bound.x == -2.0
+    assert min_bound.y == -3.0
+    assert min_bound.z == 2.0
+    assert min_bound.m == 3.0
+    assert max_bound.x == 10.0
+    assert max_bound.y == 9.0
+    assert max_bound.z == 7.0
+    assert max_bound.m == 8.0
 
     serialized_min = aggregator.serialized_min()
     serialized_max = aggregator.serialized_max()

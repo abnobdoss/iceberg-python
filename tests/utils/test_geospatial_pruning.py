@@ -312,9 +312,7 @@ def _norm_longitude(value: float) -> float:
     return ((value + 180.0) % 360.0) - 180.0
 
 
-def _interpolate_along_minor_arc(
-    start: tuple[float, float], end: tuple[float, float], fraction: float
-) -> tuple[float, float]:
+def _interpolate_along_minor_arc(start: tuple[float, float], end: tuple[float, float], fraction: float) -> tuple[float, float]:
     start_circle = _norm_longitude(start[0]) + 180.0
     end_circle = _norm_longitude(end[0]) + 180.0
     delta = end_circle - start_circle
