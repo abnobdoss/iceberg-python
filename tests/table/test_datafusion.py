@@ -16,6 +16,7 @@
 # under the License.
 
 
+from collections.abc import Generator
 from pathlib import Path
 
 import pyarrow as pa
@@ -31,13 +32,15 @@ def warehouse(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.fixture(scope="session")
-def catalog(warehouse: Path) -> Catalog:
+def catalog(warehouse: Path) -> Generator[Catalog, None, None]:
     catalog = load_catalog(
         "default",
         uri=f"sqlite:///{warehouse}/pyiceberg_catalog.db",
         warehouse=f"file://{warehouse}",
     )
-    return catalog
+    yield catalog
+
+    catalog.close()
 
 
 def test_datafusion_register_pyiceberg_table(catalog: Catalog, arrow_table_with_null: pa.Table) -> None:

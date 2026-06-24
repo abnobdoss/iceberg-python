@@ -921,6 +921,7 @@ def test_duckdb_url_import(warehouse: Path, arrow_table_with_null: pa.Table) -> 
             b"\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11",
         ),
     ]
+    catalog.close()
 
 
 @pytest.mark.integration
