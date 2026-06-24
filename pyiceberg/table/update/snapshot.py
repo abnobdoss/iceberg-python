@@ -1041,6 +1041,7 @@ class ExpireSnapshots(UpdateTableMetadata["ExpireSnapshots"]):
     _requirements: tuple[TableRequirement, ...]
     _snapshot_ids_to_expire: set[int]
     _retain_last: int | None
+    _has_other_selectors: bool
 
     def __init__(self, transaction: Transaction) -> None:
         super().__init__(transaction)
@@ -1048,6 +1049,7 @@ class ExpireSnapshots(UpdateTableMetadata["ExpireSnapshots"]):
         self._requirements = ()
         self._snapshot_ids_to_expire = set()
         self._retain_last = None
+        self._has_other_selectors = False
 
     def _commit(self) -> UpdatesAndRequirements:
         """
@@ -1064,7 +1066,7 @@ class ExpireSnapshots(UpdateTableMetadata["ExpireSnapshots"]):
         self._snapshot_ids_to_expire -= protected_ids
 
         if self._retain_last is not None:
-            standalone = len(self._snapshot_ids_to_expire) == 0
+            standalone = not self._has_other_selectors
             unprotected_snapshots = sorted(
                 [
                     snapshot
@@ -1126,6 +1128,7 @@ class ExpireSnapshots(UpdateTableMetadata["ExpireSnapshots"]):
         if snapshot_id in self._get_protected_snapshot_ids():
             raise ValueError(f"Snapshot with ID {snapshot_id} is protected and cannot be expired.")
 
+        self._has_other_selectors = True
         self._snapshot_ids_to_expire.add(snapshot_id)
 
         return self
@@ -1155,6 +1158,7 @@ class ExpireSnapshots(UpdateTableMetadata["ExpireSnapshots"]):
         Returns:
             This for method chaining.
         """
+        self._has_other_selectors = True
         protected_ids = self._get_protected_snapshot_ids()
         expire_from = datetime_to_millis(dt)
         for snapshot in self._transaction.table_metadata.snapshots:
