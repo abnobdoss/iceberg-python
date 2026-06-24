@@ -125,8 +125,10 @@ def test_write_position_delete_file(catalog: Catalog) -> None:
     schema, rows = _read_delete_parquet(table, delete_file)
     assert schema.field("file_path").metadata == {PYARROW_PARQUET_FIELD_ID_KEY: b"2147483546"}
     assert schema.field("file_path").type == pa.string()
+    assert schema.field("file_path").nullable is False
     assert schema.field("pos").metadata == {PYARROW_PARQUET_FIELD_ID_KEY: b"2147483545"}
     assert schema.field("pos").type == pa.int64()
+    assert schema.field("pos").nullable is False
     assert rows.column("pos").to_pylist() == [0, 2]
     assert rows.column("file_path").to_pylist() == [data_file.file_path, data_file.file_path]
 
@@ -154,6 +156,45 @@ def test_write_position_delete_file_rejects_non_data_reference(catalog: Catalog)
 
     with pytest.raises(ValueError, match="referenced_data_file must be a DATA file"):
         write_position_delete_file(table.io, table.metadata, delete_file, [0])
+
+
+def test_write_position_delete_file_rejects_v1_table(catalog: Catalog) -> None:
+    try:
+        catalog.create_namespace("default")
+    except NamespaceAlreadyExistsError:
+        pass
+    table = catalog.create_table(
+        identifier="default.test_write_position_delete_file_rejects_v1_table",
+        schema=ICEBERG_SCHEMA,
+        properties={"format-version": "1"},
+    )
+    table.append(_arrow_table([{"id": 1, "data": "a"}, {"id": 2, "data": "b"}]))
+    data_file = _current_data_files(table)[0]
+
+    with pytest.raises(ValueError, match="v2"):
+        write_position_delete_file(table.io, table.metadata, data_file, [0])
+
+
+def test_append_delete_file_rejects_equality_delete(catalog: Catalog) -> None:
+    table = _create_v2_table(catalog, "default.test_append_delete_file_rejects_equality_delete")
+    data_file = _append_initial_rows(table)
+    eq_delete = DataFile.from_args(
+        _table_format_version=table.metadata.format_version,
+        content=DataFileContent.EQUALITY_DELETES,
+        file_path=data_file.file_path,
+        file_format=data_file.file_format,
+        partition=data_file.partition,
+        record_count=1,
+        file_size_in_bytes=1,
+        equality_ids=[1],
+        sort_order_id=None,
+        key_metadata=None,
+    )
+
+    with pytest.raises(ValueError, match="append_delete_file requires a position-delete file"):
+        with table.transaction() as tx:
+            with tx.update_snapshot().row_delta() as row_delta:
+                row_delta.append_delete_file(eq_delete)
 
 
 def test_write_position_delete_file_falls_back_to_default_spec_id(catalog: Catalog) -> None:
@@ -232,7 +273,7 @@ def test_append_delete_file_rejects_data_file(catalog: Catalog) -> None:
     table = _create_v2_table(catalog, "default.test_append_delete_file_rejects_data_file")
     data_file = _append_initial_rows(table)
 
-    with pytest.raises(ValueError, match="append_delete_file requires a delete file"):
+    with pytest.raises(ValueError, match="append_delete_file requires a position-delete file"):
         _commit_delete_file(table, data_file)
 
 
