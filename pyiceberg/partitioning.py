@@ -28,6 +28,7 @@ from pydantic import (
     BeforeValidator,
     Field,
     PlainSerializer,
+    SerializationInfo,
     WithJsonSchema,
     model_serializer,
     model_validator,
@@ -151,16 +152,17 @@ class PartitionField(IcebergBaseModel):
         return ids[0]
 
     @model_serializer(mode="wrap")
-    def serialize_model(self, handler: Any) -> dict[str, Any]:
+    def serialize_model(self, handler: Any, info: SerializationInfo) -> dict[str, Any]:
         result = handler(self)
+        single_key, multi_key = ("source-id", "source-ids") if info.by_alias else ("source_id", "source_ids")
         source_ids = self.source_ids_normalized
         if len(source_ids) > 1:
-            result.pop("source-id", None)
-            result["source-ids"] = list(source_ids)
+            result.pop(single_key, None)
+            result[multi_key] = list(source_ids)
         else:
-            result.pop("source-ids", None)
+            result.pop(multi_key, None)
             if source_ids:
-                result["source-id"] = source_ids[0]
+                result[single_key] = source_ids[0]
         return result
 
     def __str__(self) -> str:
@@ -319,7 +321,6 @@ class PartitionSpec(IcebergBaseModel):
         parents = schema._lazy_id_to_parent
 
         for field in self.fields:
-            source_fields = []
             for source_id in field.source_ids_normalized:
                 source_field = schema_fields.get(source_id)
 
@@ -339,7 +340,6 @@ class PartitionSpec(IcebergBaseModel):
                     raise ValidationError(
                         f"Invalid source field {source_field.name} with type {source_type} " + f"for transform: {field.transform}"
                     )
-                source_fields.append(source_field)
 
                 # The only valid parent types for a PartitionField are StructTypes. This must be checked recursively
                 parent_id = parents.get(source_id)
@@ -348,9 +348,6 @@ class PartitionSpec(IcebergBaseModel):
                     if not parent_type.is_struct:
                         raise ValidationError(f"Invalid partition field parent: {parent_type}")
                     parent_id = parents.get(parent_id)
-
-            if not source_fields:
-                continue
 
 
 UNPARTITIONED_PARTITION_SPEC = PartitionSpec(spec_id=0)

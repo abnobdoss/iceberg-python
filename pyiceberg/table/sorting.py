@@ -23,6 +23,7 @@ from pydantic import (
     BeforeValidator,
     Field,
     PlainSerializer,
+    SerializationInfo,
     WithJsonSchema,
     model_serializer,
     model_validator,
@@ -154,16 +155,17 @@ class SortField(IcebergBaseModel):
         return ids[0]
 
     @model_serializer(mode="wrap")
-    def serialize_model(self, handler: Any) -> dict[str, Any]:
+    def serialize_model(self, handler: Any, info: SerializationInfo) -> dict[str, Any]:
         result = handler(self)
+        single_key, multi_key = ("source-id", "source-ids") if info.by_alias else ("source_id", "source_ids")
         source_ids = self.source_ids_normalized
         if len(source_ids) > 1:
-            result.pop("source-id", None)
-            result["source-ids"] = list(source_ids)
+            result.pop(single_key, None)
+            result[multi_key] = list(source_ids)
         else:
-            result.pop("source-ids", None)
+            result.pop(multi_key, None)
             if source_ids:
-                result["source-id"] = source_ids[0]
+                result[single_key] = source_ids[0]
         return result
 
     def __str__(self) -> str:

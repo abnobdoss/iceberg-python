@@ -75,6 +75,30 @@ def test_partition_spec_multi_source_compatibility_checks_all_sources() -> None:
     spec.check_compatible(schema)
 
 
+def test_single_source_serializer_honors_by_alias() -> None:
+    field = PartitionField(source_id=1, field_id=1000, transform=IdentityTransform(), name="x")
+    sort_field = SortField(
+        source_id=2,
+        transform=IdentityTransform(),
+        direction=SortDirection.ASC,
+        null_order=NullOrder.NULLS_FIRST,
+    )
+
+    # by_alias=False must use the python field name only (no duplicate aliased key)
+    assert field.model_dump(by_alias=False) == {
+        "source_id": 1,
+        "field_id": 1000,
+        "transform": "identity",
+        "name": "x",
+    }
+    assert sort_field.model_dump(by_alias=False)["source_id"] == 2
+    assert "source-id" not in sort_field.model_dump(by_alias=False)
+
+    # by_alias=True keeps the spec-aliased key
+    assert field.model_dump(by_alias=True)["source-id"] == 1
+    assert "source_id" not in field.model_dump(by_alias=True)
+
+
 def test_sort_field_multi_source_ids_roundtrip() -> None:
     payload = '{"source-ids":[1,2],"transform":"identity","direction":"asc","null-order":"nulls-first"}'
 
