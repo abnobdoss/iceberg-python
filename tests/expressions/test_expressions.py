@@ -1390,6 +1390,41 @@ def test_deepcopy_then_pickle() -> None:
 #          |__/     |__/
 
 
+def test_always_true_is_truthy() -> None:
+    assert bool(AlwaysTrue()) is True
+    # Usable directly in control flow.
+    assert "taken" == ("taken" if AlwaysTrue() else "skipped")
+
+
+def test_always_false_is_falsy() -> None:
+    assert bool(AlwaysFalse()) is False
+    assert "skipped" == ("taken" if AlwaysFalse() else "skipped")
+
+
+def test_inverted_constants_have_expected_truth_value() -> None:
+    assert bool(~AlwaysTrue()) is False
+    assert bool(~AlwaysFalse()) is True
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        EqualTo("x", 1),
+        NotEqualTo("x", 1),
+        IsNull("x"),
+        NotNull("x"),
+        In("x", (1, 2)),
+        And(EqualTo("x", 1), EqualTo("y", 2)),
+        Or(EqualTo("x", 1), EqualTo("y", 2)),
+        Not(EqualTo("x", 1)),
+    ],
+)
+def test_non_constant_expression_truth_value_is_ambiguous(expression: BooleanExpression) -> None:
+    # Truthiness is reserved for control flow; ``~expr`` is the negation operator.
+    with pytest.raises(TypeError, match="truth value of .* is ambiguous"):
+        bool(expression)
+
+
 def _assert_literal_predicate_type(expr: LiteralPredicate) -> None:
     assert_type(expr, LiteralPredicate)
 
