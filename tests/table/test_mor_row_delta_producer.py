@@ -277,6 +277,16 @@ def test_append_delete_file_rejects_data_file(catalog: Catalog) -> None:
         _commit_delete_file(table, data_file)
 
 
+def test_append_delete_file_not_exposed_on_fast_append(catalog: Catalog) -> None:
+    # Delete files must only be appendable via the row-delta path, never via fast/merge append,
+    # which would commit row deletions under append semantics.
+    table = _create_v2_table(catalog, "default.test_append_delete_file_not_exposed_on_fast_append")
+    with table.transaction() as tx:
+        assert not hasattr(tx.update_snapshot().fast_append(), "append_delete_file")
+        assert not hasattr(tx.update_snapshot().merge_append(), "append_delete_file")
+        assert hasattr(tx.update_snapshot().row_delta(), "append_delete_file")
+
+
 def test_position_delete_sequence_number_does_not_affect_later_appends(catalog: Catalog) -> None:
     table = _create_v2_table(catalog, "default.test_position_delete_sequence_number_scoping")
     data_file = _append_initial_rows(table)
