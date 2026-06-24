@@ -31,7 +31,6 @@ from pyiceberg.table.snapshots import Operation
 from pyiceberg.transforms import IdentityTransform
 from pyiceberg.types import LongType, NestedField, StringType
 
-
 ICEBERG_SCHEMA = Schema(
     NestedField(1, "id", LongType(), required=True),
     NestedField(2, "category", StringType(), required=False),
@@ -138,6 +137,25 @@ def test_single_row_mor_delete(catalog: Catalog) -> None:
     assert delete_schema.field("pos").type == pa.int64()
     assert not delete_schema.field("pos").nullable
     assert delete_schema.field("pos").metadata[b"PARQUET:field_id"] == b"2147483545"
+
+
+def test_delete_file_path_bound_is_full_untruncated_path(catalog: Catalog) -> None:
+    table = _create_table(catalog, "path_bound")
+    _append_rows(table, [(1, "a", "one"), (2, "a", "two"), (3, "a", "three")])
+
+    table.delete(EqualTo("id", 2))
+
+    delete_files = _position_delete_files(table)
+    assert len(delete_files) == 1
+    delete_file = delete_files[0]
+    data_path = _data_file_paths(table)[0]
+
+    path_field_id = 2147483546
+    lower = delete_file.lower_bounds[path_field_id].decode("utf-8")
+    upper = delete_file.upper_bounds[path_field_id].decode("utf-8")
+    # The reader only routes through the exact-path delete index when lower == upper == the full
+    # data-file path; a truncated string bound would silently fall back to the partition index.
+    assert lower == upper == data_path
 
 
 def test_multi_row_mor_delete(catalog: Catalog) -> None:

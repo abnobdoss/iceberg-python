@@ -252,10 +252,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         existing_manifests = executor.submit(self._existing_manifests)
 
         return self._process_manifests(
-            added_manifests.result()
-            + added_delete_manifests.result()
-            + delete_manifests.result()
-            + existing_manifests.result()
+            added_manifests.result() + added_delete_manifests.result() + delete_manifests.result() + existing_manifests.result()
         )
 
     def _summary(self, snapshot_properties: dict[str, str] = EMPTY_DICT) -> Summary:
@@ -288,7 +285,6 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             )
 
         if len(self._deleted_data_files) > 0:
-            specs = table_metadata.specs()
             for data_file in self._deleted_data_files:
                 ssc.remove_file(
                     data_file=data_file,

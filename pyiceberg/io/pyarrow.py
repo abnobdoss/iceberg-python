@@ -2724,9 +2724,7 @@ def _write_position_delete_file(
         schema=arrow_schema,
     )
 
-    location_provider = load_location_provider(
-        table_location=table_metadata.location, table_properties=table_metadata.properties
-    )
+    location_provider = load_location_provider(table_location=table_metadata.location, table_properties=table_metadata.properties)
     file_path = location_provider.new_data_location(
         data_file_name=f"00000-{next(counter)}-{write_uuid}-deletes.parquet",
     )
@@ -2735,9 +2733,18 @@ def _write_position_delete_file(
         with pq.ParquetWriter(fos, schema=arrow_table.schema, store_decimal_as_integer=True, **parquet_writer_kwargs) as writer:
             writer.write(arrow_table, row_group_size=row_group_size)
 
+    stats_columns = compute_statistics_plan(POSITIONAL_DELETE_WRITE_SCHEMA, table_metadata.properties)
+    # The reader routes a position-delete file to a data file by its exact file_path bound, so the
+    # bound must be the full, untruncated path rather than the default truncate(16) string metric.
+    stats_columns[2147483546] = StatisticsCollector(
+        field_id=2147483546,
+        iceberg_type=StringType(),
+        mode=MetricsMode(MetricModeTypes.FULL),
+        column_name="file_path",
+    )
     statistics = data_file_statistics_from_parquet_metadata(
         parquet_metadata=writer.writer.metadata,
-        stats_columns=compute_statistics_plan(POSITIONAL_DELETE_WRITE_SCHEMA, table_metadata.properties),
+        stats_columns=stats_columns,
         parquet_column_mapping=parquet_path_to_id_mapping(POSITIONAL_DELETE_WRITE_SCHEMA),
     )
 
