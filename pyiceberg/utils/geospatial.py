@@ -189,20 +189,35 @@ class _EnvelopeAccumulator:
     y_max: float | None = None
     z_max: float | None = None
     m_max: float | None = None
-    longitudes: list[float] | None = None
+    # Geography longitude occupancy is the union of per-EDGE minor-arc spans (in
+    # circle coordinates [0, 360)). Collecting bare vertices and taking their
+    # minimal enclosing arc is unsound: it can exclude an edge that connects two
+    # vertices the "long way" around, dropping rows that lie on that edge.
+    _segments: list[tuple[float, float]] | None = None
+    _prev_circle_lon: float | None = None
 
     def __post_init__(self) -> None:
         if self.is_geography:
-            self.longitudes = []
+            self._segments = []
+
+    def start_sequence(self) -> None:
+        # Edges only connect consecutive vertices WITHIN the same linestring/ring.
+        # Resetting before each sequence prevents a spurious edge across sub-geometries.
+        self._prev_circle_lon = None
 
     def add_point(self, x: float, y: float, z: float | None, m: float | None) -> None:
         if math.isnan(x) or math.isnan(y):
             return
 
         if self.is_geography:
-            if self.longitudes is None:
-                self.longitudes = []
-            self.longitudes.append(_normalize_longitude(x))
+            if self._segments is None:
+                self._segments = []
+            circle_lon = _to_circle(_normalize_longitude(x))
+            # Zero-width span at the vertex itself (covers isolated points).
+            self._segments.append((circle_lon, circle_lon))
+            if self._prev_circle_lon is not None:
+                self._segments.append(_edge_minor_arc(self._prev_circle_lon, circle_lon))
+            self._prev_circle_lon = circle_lon
         else:
             self.x_min = x if self.x_min is None else min(self.x_min, x)
             self.x_max = x if self.x_max is None else max(self.x_max, x)
@@ -223,9 +238,9 @@ class _EnvelopeAccumulator:
             return None
 
         if self.is_geography:
-            if not self.longitudes:
+            if not self._segments:
                 return None
-            x_min, x_max = _minimal_longitude_interval(self.longitudes)
+            x_min, x_max = _longitude_interval_from_segments(self._segments)
         else:
             if self.x_min is None or self.x_max is None:
                 return None
@@ -348,6 +363,7 @@ def _parse_points(
     has_m: bool,
 ) -> None:
     count = reader.read_uint32(little_endian)
+    accumulator.start_sequence()
     for _ in range(count):
         x = reader.read_double(little_endian)
         y = reader.read_double(little_endian)
@@ -373,6 +389,7 @@ def _parse_point(
     has_z: bool,
     has_m: bool,
 ) -> None:
+    accumulator.start_sequence()
     x = reader.read_double(little_endian)
     y = reader.read_double(little_endian)
 
@@ -411,28 +428,54 @@ def _from_circle(value: float) -> float:
     return value - 180.0
 
 
-def _minimal_longitude_interval(longitudes: list[float]) -> tuple[float, float]:
+def _edge_minor_arc(start_circle: float, end_circle: float) -> tuple[float, float]:
+    # The longitude span of a geography edge is the SHORTER arc between its two
+    # endpoints. A geodesic edge whose endpoints differ by < 180 deg of longitude
+    # stays within that minor arc; at exactly 180 deg the two arcs are equal and
+    # either choice is sound. Returned as a (possibly wrapping) circle-space arc.
+    lo, hi = (start_circle, end_circle) if start_circle <= end_circle else (end_circle, start_circle)
+    direct = hi - lo
+    if direct <= 180.0:
+        return lo, hi
+    # The shorter way wraps across the 0/360 seam (i.e. across the antimeridian).
+    return hi, lo + 360.0
+
+
+def _longitude_interval_from_segments(segments: list[tuple[float, float]]) -> tuple[float, float]:
     # Converting longitude bounds to/from circle coordinates can introduce tiny
     # floating-point drift at the reconstructed interval edges. Pruning callers
     # must use geospatial_pruning.bbox_might_match, which applies conservative
     # boundary tolerance instead of exact edge comparisons.
-    points = sorted({_to_circle(_normalize_longitude(v)) % 360.0 for v in longitudes})
-    if len(points) == 1:
-        lon = _from_circle(points[0])
-        return lon, lon
+    normalized: list[tuple[float, float]] = []
+    for start, end in segments:
+        if end <= 360.0:
+            normalized.append((start, end))
+        else:
+            # Wrapping arc: split at the 0/360 seam into two non-wrapping segments.
+            normalized.append((start, 360.0))
+            normalized.append((0.0, end - 360.0))
 
-    max_gap = -1.0
-    max_gap_idx = 0
-    for idx in range(len(points)):
-        current = points[idx]
-        nxt = points[(idx + 1) % len(points)] + (360.0 if idx == len(points) - 1 else 0.0)
-        gap = nxt - current
-        if gap > max_gap:
-            max_gap = gap
-            max_gap_idx = idx
+    merged = _merge_segments(normalized)
+    if not merged:
+        raise ValueError("Cannot build longitude interval from empty segments")
 
-    start = points[(max_gap_idx + 1) % len(points)]
-    end = points[max_gap_idx]
+    largest_gap = -1.0
+    gap_start = merged[0][1]
+    gap_end = merged[0][0] + 360.0
+    for idx in range(len(merged)):
+        current_end = merged[idx][1]
+        next_start = merged[(idx + 1) % len(merged)][0] + (360.0 if idx == len(merged) - 1 else 0.0)
+        gap = next_start - current_end
+        if gap > largest_gap:
+            largest_gap = gap
+            gap_start = current_end
+            gap_end = next_start
+
+    if largest_gap <= 1e-12:
+        return -180.0, 180.0
+
+    start = gap_end % 360.0
+    end = gap_start % 360.0
     return _from_circle(start), _from_circle(end)
 
 

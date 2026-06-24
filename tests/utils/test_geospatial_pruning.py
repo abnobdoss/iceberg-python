@@ -228,6 +228,26 @@ def test_bbox_pruning_ignores_z_and_m_dimensions() -> None:
     assert bbox_might_match("st-intersects", query_wkb, lower_bound, upper_bound, is_geography=False)
 
 
+@pytest.mark.parametrize("is_geography", [False, True])
+@pytest.mark.parametrize(
+    ("lower", "upper"),
+    [
+        (GeospatialBound(x=float("nan"), y=0.0), GeospatialBound(x=10.0, y=10.0)),
+        (GeospatialBound(x=0.0, y=float("nan")), GeospatialBound(x=10.0, y=10.0)),
+        (GeospatialBound(x=0.0, y=0.0), GeospatialBound(x=float("nan"), y=10.0)),
+        (GeospatialBound(x=0.0, y=0.0), GeospatialBound(x=10.0, y=float("inf"))),
+    ],
+)
+def test_bbox_pruning_non_finite_bound_is_treated_as_might_match(
+    is_geography: bool, lower: GeospatialBound, upper: GeospatialBound
+) -> None:
+    # Safety contract: a malformed/non-finite stored bound must never prune to False.
+    lower_bound = serialize_geospatial_bound(lower)
+    upper_bound = serialize_geospatial_bound(upper)
+
+    assert bbox_might_match("st-intersects", _point_wkb(5.0, 5.0), lower_bound, upper_bound, is_geography=is_geography)
+
+
 def test_bbox_pruning_empty_query_returns_true() -> None:
     lower_bound, upper_bound = _bounds(0.0, 0.0, 10.0, 10.0)
     query_wkb = _linestring_wkb([])
@@ -284,6 +304,76 @@ def test_bbox_pruning_never_prunes_files_own_points(
                     is_geography=is_geography,
                 ):
                     false_negatives.append((points, point, predicate))
+
+    assert false_negatives == []
+
+
+def _norm_longitude(value: float) -> float:
+    return ((value + 180.0) % 360.0) - 180.0
+
+
+def _interpolate_along_minor_arc(
+    start: tuple[float, float], end: tuple[float, float], fraction: float
+) -> tuple[float, float]:
+    start_circle = _norm_longitude(start[0]) + 180.0
+    end_circle = _norm_longitude(end[0]) + 180.0
+    delta = end_circle - start_circle
+    if delta > 180.0:
+        delta -= 360.0
+    if delta < -180.0:
+        delta += 360.0
+    longitude = _norm_longitude((start_circle + delta * fraction) - 180.0)
+    latitude = start[1] + (end[1] - start[1]) * fraction
+    return longitude, latitude
+
+
+def test_bbox_pruning_geography_keeps_point_on_excluded_edge() -> None:
+    # Regression: LINESTRING(-120 0, 0 0, 120 0) contains POINT(-60 0) on its first
+    # edge. A vertex-set minimal-arc bound wrongly wrapped and pruned this point.
+    line = struct.pack("<BII" + "dd" * 3, 1, 2, 3, -120.0, 0.0, 0.0, 0.0, 120.0, 0.0)
+    aggregator = GeospatialStatsAggregator(is_geography=True)
+    aggregator.add(line)
+    lower_bound = aggregator.serialized_min()
+    upper_bound = aggregator.serialized_max()
+    assert lower_bound is not None
+    assert upper_bound is not None
+
+    for longitude in (-120.0, -90.0, -60.0, -30.0, 0.0, 60.0, 120.0):
+        for predicate in _SUPPORTED_PREDICATES:
+            assert bbox_might_match(
+                predicate,
+                _point_wkb(longitude, 0.0),
+                lower_bound,
+                upper_bound,
+                is_geography=True,
+            )
+
+
+def test_bbox_pruning_geography_never_prunes_points_along_its_own_edges() -> None:
+    rng = Random(20240623)
+    false_negatives: list[tuple[list[tuple[float, float]], tuple[float, float], str]] = []
+
+    for _ in range(2000):
+        vertices = [(rng.uniform(-180.0, 180.0), rng.uniform(-85.0, 85.0)) for _ in range(rng.randint(2, 5))]
+        aggregator = GeospatialStatsAggregator(is_geography=True)
+        aggregator.add(_linestring_wkb(vertices))
+        lower_bound = aggregator.serialized_min()
+        upper_bound = aggregator.serialized_max()
+        assert lower_bound is not None
+        assert upper_bound is not None
+
+        for index in range(len(vertices) - 1):
+            for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+                sample = _interpolate_along_minor_arc(vertices[index], vertices[index + 1], fraction)
+                for predicate in _SUPPORTED_PREDICATES:
+                    if not bbox_might_match(
+                        predicate,
+                        _point_wkb(*sample),
+                        lower_bound,
+                        upper_bound,
+                        is_geography=True,
+                    ):
+                        false_negatives.append((vertices, sample, predicate))
 
     assert false_negatives == []
 

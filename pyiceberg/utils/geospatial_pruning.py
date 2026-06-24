@@ -51,6 +51,11 @@ def bbox_might_match(
     lower = deserialize_geospatial_bound(lower_bound)
     upper = deserialize_geospatial_bound(upper_bound)
 
+    # A non-finite (NaN/inf) stored bound is malformed/unknown. NaN comparisons are
+    # always false, which would silently prune to False, so fall back to "might match".
+    if not all(math.isfinite(value) for value in (lower.x, lower.y, upper.x, upper.y)):
+        return True
+
     y_overlaps = _scalar_intervals_overlap(lower.y, upper.y, query_envelope.y_min, query_envelope.y_max)
     if not y_overlaps:
         return False
