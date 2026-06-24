@@ -17,6 +17,7 @@
 import datetime
 import os
 import uuid
+from collections.abc import Generator
 from pathlib import PosixPath
 from unittest import mock
 from unittest.mock import MagicMock
@@ -97,12 +98,13 @@ def env_vars(mocker: MockFixture) -> None:
 
 
 @pytest.fixture(name="catalog")
-def fixture_catalog(mocker: MockFixture, tmp_path: PosixPath) -> InMemoryCatalog:
+def fixture_catalog(mocker: MockFixture, tmp_path: PosixPath) -> Generator[InMemoryCatalog, None, None]:
     in_memory_catalog = InMemoryCatalog(
         "test.in_memory.catalog", **{WAREHOUSE: tmp_path.absolute().as_posix(), "test.key": "test.value"}
     )
     mocker.patch("pyiceberg.cli.console.load_catalog", return_value=in_memory_catalog)
-    return in_memory_catalog
+    yield in_memory_catalog
+    in_memory_catalog.close()
 
 
 @pytest.fixture(name="namespace_properties")

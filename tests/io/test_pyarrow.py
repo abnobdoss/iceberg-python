@@ -20,7 +20,7 @@ import os
 import tempfile
 import uuid
 import warnings
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -1506,8 +1506,10 @@ field_3: [[3]]"""
 
 
 @pytest.fixture
-def catalog() -> InMemoryCatalog:
-    return InMemoryCatalog("test.in_memory.catalog", **{"test.key": "test.value"})
+def catalog() -> Generator[InMemoryCatalog, None, None]:
+    cat = InMemoryCatalog("test.in_memory.catalog", **{"test.key": "test.value"})
+    yield cat
+    cat.close()
 
 
 def test_projection_filter(schema_int: Schema, file_int: str) -> None:
