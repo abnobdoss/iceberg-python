@@ -99,8 +99,7 @@ def _longitude_segments_overlap(left_segment: tuple[float, float], right_segment
     right_start, right_end = right_segment
 
     return any(
-        _scalar_intervals_overlap(left_start, left_end, right_start + shift, right_end + shift)
-        for shift in (-360.0, 0.0, 360.0)
+        _scalar_intervals_overlap(left_start, left_end, right_start + shift, right_end + shift) for shift in (-360.0, 0.0, 360.0)
     )
 
 
