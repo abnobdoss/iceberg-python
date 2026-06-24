@@ -150,6 +150,7 @@ def test_mor_delete_basic_produces_position_delete_without_rewriting_data_files(
 
     current_snapshot = table.current_snapshot()
     assert current_snapshot is not None
+    assert current_snapshot.summary is not None
     assert current_snapshot.summary.operation == Operation.OVERWRITE
 
     reloaded = catalog.load_table(identifier)
@@ -226,6 +227,7 @@ def test_mor_delete_sequence_number_scopes_delete_to_existing_data_files(catalog
     table.delete(EqualTo("id", 2))
     delete_snapshot = table.current_snapshot()
     assert delete_snapshot is not None
+    assert delete_snapshot.sequence_number is not None
 
     # The position-delete file's sequence number must equal the delete snapshot's sequence
     # number. This is what scopes the delete to pre-existing data files only: a positional
