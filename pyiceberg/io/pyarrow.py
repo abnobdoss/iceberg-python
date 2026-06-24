@@ -1670,7 +1670,9 @@ def _filter_batch_and_positions(
 
 def _row_id_array(task: FileScanTask, file_schema: Schema, batch: pa.RecordBatch, positions: pa.Array | None) -> pa.Array:
     if task.file.first_row_id is None:
-        raise ValueError("Cannot read _row_id: row lineage requires a v3 data file with first_row_id")
+        # Snapshots written before row lineage was enabled (e.g. pre-upgrade snapshots of an
+        # upgraded table) have a null first_row_id, so _row_id reads as null for all rows.
+        return pa.nulls(batch.num_rows, type=pa.int64())
     if positions is None:
         raise ValueError("Cannot read _row_id: row positions were not materialized")
 
@@ -1688,7 +1690,9 @@ def _last_updated_sequence_number_array(task: FileScanTask, file_schema: Schema,
     if task.data_sequence_number is None:
         if physical_sequence_numbers is None:
             raise ValueError(
-                "Cannot read _last_updated_sequence_number: data sequence number is missing from the file scan task"
+                "Cannot read _last_updated_sequence_number: the file scan task has no data sequence number. "
+                "Server-side/REST scan planning does not yet supply the data sequence number required to "
+                "materialize this column."
             )
         physical_sequence_numbers = _as_int64_array(physical_sequence_numbers)
         if physical_sequence_numbers.null_count > 0:

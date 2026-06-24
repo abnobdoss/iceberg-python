@@ -22,7 +22,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from pyiceberg.catalog.memory import InMemoryCatalog
-from pyiceberg.expressions import GreaterThan
+from pyiceberg.expressions import AlwaysTrue, GreaterThan
 from pyiceberg.expressions.visitors import bind
 from pyiceberg.io.pyarrow import PYARROW_PARQUET_FIELD_ID_KEY, PyArrowFileIO, _task_to_record_batches
 from pyiceberg.manifest import DataFile, DataFileContent, FileFormat, ManifestContent, ManifestEntry, ManifestEntryStatus
@@ -166,8 +166,17 @@ def test_v2_scan_select_row_id_raises(tmp_path: Path) -> None:
     table.append(_batch([1, 2, 3]))
     table = catalog.load_table("ns.t")
 
-    with pytest.raises(ValueError, match="row lineage requires a v3 data file with first_row_id"):
+    with pytest.raises(ValueError, match="only available for v3"):
         table.scan().select("_row_id").to_arrow()
+
+
+def test_v2_scan_select_last_updated_sequence_number_raises(tmp_path: Path) -> None:
+    catalog, table = _create_table(tmp_path, format_version="2")
+    table.append(_batch([1, 2, 3]))
+    table = catalog.load_table("ns.t")
+
+    with pytest.raises(ValueError, match="only available for v3"):
+        table.scan().select("_last_updated_sequence_number").to_arrow()
 
 
 def test_v3_select_star_does_not_include_row_id(tmp_path: Path) -> None:
@@ -216,3 +225,41 @@ def test_row_id_positions_survive_positional_deletes_and_filter(tmp_path: Path) 
 
     assert len(batches) == 1
     assert batches[0].to_pydict() == {"id": [3, 5], "_row_id": [12, 14]}
+
+
+def test_row_id_null_when_first_row_id_missing(tmp_path: Path) -> None:
+    arrow_schema = pa.schema((pa.field("id", pa.int32(), nullable=True, metadata={PYARROW_PARQUET_FIELD_ID_KEY: "1"}),))
+    arrow_table = pa.table([pa.array([1, 2, 3, 4, 5], type=pa.int32())], schema=arrow_schema)
+    file_path = str(tmp_path / "row-id-null-first-row-id.parquet")
+    with pq.ParquetWriter(file_path, arrow_schema) as writer:
+        writer.write_table(arrow_table)
+
+    data_file = DataFile.from_args(
+        content=DataFileContent.DATA,
+        file_path=file_path,
+        file_format=FileFormat.PARQUET,
+        partition={},
+        record_count=len(arrow_table),
+        file_size_in_bytes=22,
+    )
+    # Pre-upgrade snapshots have a null first_row_id; _row_id must read as null per the v3 spec.
+    data_file.first_row_id = None
+
+    table_schema = Schema(NestedField(1, "id", IntegerType(), required=False))
+    projected_schema = Schema(NestedField(1, "id", IntegerType(), required=False), ROW_ID_FIELD)
+
+    batches = list(
+        _task_to_record_batches(
+            PyArrowFileIO(),
+            FileScanTask(data_file, data_sequence_number=7),
+            bound_row_filter=AlwaysTrue(),
+            projected_schema=projected_schema,
+            table_schema=table_schema,
+            projected_field_ids={1, ROW_ID_FIELD_ID},
+            positional_deletes=None,
+            case_sensitive=True,
+        )
+    )
+
+    assert len(batches) == 1
+    assert batches[0].to_pydict() == {"id": [1, 2, 3, 4, 5], "_row_id": [None, None, None, None, None]}

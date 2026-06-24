@@ -1989,6 +1989,12 @@ class TableScan(BaseScan):
                     metadata_fields.append(metadata_field)
                     metadata_field_ids.add(metadata_field.field_id)
 
+        if metadata_fields and self.table_metadata.format_version < 3:
+            raise ValueError(
+                "Row lineage metadata columns (_row_id, _last_updated_sequence_number) are only available for v3+ "
+                f"tables; this table is format-version {self.table_metadata.format_version}."
+            )
+
         if "*" in self.selected_fields:
             if not metadata_fields:
                 return current_schema
