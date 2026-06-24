@@ -16,6 +16,7 @@
 # under the License.
 
 from pathlib import Path
+from typing import cast
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -24,10 +25,19 @@ import pytest
 from pyiceberg.catalog.memory import InMemoryCatalog
 from pyiceberg.expressions import AlwaysTrue, GreaterThan
 from pyiceberg.expressions.visitors import bind
+from pyiceberg.io import FileIO
 from pyiceberg.io.pyarrow import PYARROW_PARQUET_FIELD_ID_KEY, PyArrowFileIO, _task_to_record_batches
-from pyiceberg.manifest import DataFile, DataFileContent, FileFormat, ManifestContent, ManifestEntry, ManifestEntryStatus
+from pyiceberg.manifest import (
+    DataFile,
+    DataFileContent,
+    FileFormat,
+    ManifestContent,
+    ManifestEntry,
+    ManifestEntryStatus,
+    ManifestFile,
+)
 from pyiceberg.schema import ROW_ID_FIELD, ROW_ID_FIELD_ID, Schema
-from pyiceberg.table import FileScanTask, _open_manifest
+from pyiceberg.table import FileScanTask, Table, _open_manifest
 from pyiceberg.types import IntegerType, NestedField, StringType
 
 SCHEMA = Schema(
@@ -35,10 +45,12 @@ SCHEMA = Schema(
     NestedField(field_id=2, name="name", field_type=StringType(), required=False),
 )
 
-ARROW_SCHEMA = pa.schema([
-    pa.field("id", pa.int32(), nullable=True),
-    pa.field("name", pa.string(), nullable=True),
-])
+ARROW_SCHEMA = pa.schema(
+    [
+        pa.field("id", pa.int32(), nullable=True),
+        pa.field("name", pa.string(), nullable=True),
+    ]
+)
 
 
 def _batch(ids: list[int]) -> pa.Table:
@@ -48,14 +60,14 @@ def _batch(ids: list[int]) -> pa.Table:
     )
 
 
-def _create_table(tmp_path: Path, format_version: str = "3"):
+def _create_table(tmp_path: Path, format_version: str = "3") -> tuple[InMemoryCatalog, Table]:
     catalog = InMemoryCatalog(f"row-id-read-{format_version}", warehouse=f"file://{tmp_path}")
     catalog.create_namespace("ns")
     table = catalog.create_table("ns.t", schema=SCHEMA, properties={"format-version": format_version})
     return catalog, table
 
 
-def _data_sequence_numbers(table) -> set[int]:
+def _data_sequence_numbers(table: Table) -> set[int]:
     snapshot = table.metadata.current_snapshot()
     assert snapshot is not None
 
@@ -104,7 +116,7 @@ def test_open_manifest_row_id_inheritance_counts_deleted_null_first_row_id_entri
         def __init__(self) -> None:
             self.discard_deleted: bool | None = None
 
-        def fetch_manifest_entry(self, io, discard_deleted: bool = True):
+        def fetch_manifest_entry(self, io: FileIO, discard_deleted: bool = True) -> list[ManifestEntry]:
             self.discard_deleted = discard_deleted
             entries = [deleted_entry, live_entry]
             if discard_deleted:
@@ -113,7 +125,7 @@ def test_open_manifest_row_id_inheritance_counts_deleted_null_first_row_id_entri
 
     manifest = ManifestWithDeletedEntry()
 
-    entries = _open_manifest(object(), manifest, lambda _: True, lambda _: True)
+    entries = _open_manifest(cast(FileIO, object()), cast(ManifestFile, manifest), lambda _: True, lambda _: True)
 
     assert manifest.discard_deleted is False
     assert [entry.data_file.file_path for entry in entries] == ["live.parquet"]

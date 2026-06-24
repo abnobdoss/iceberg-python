@@ -24,6 +24,7 @@ to None, and that the full v3 metadata round-trips through JSON.
 
 import json
 from pathlib import Path
+from typing import cast
 
 import pyarrow as pa
 import pytest
@@ -46,10 +47,12 @@ SCHEMA = Schema(
     NestedField(field_id=2, name="name", field_type=StringType(), required=False),
 )
 
-ARROW_SCHEMA = pa.schema([
-    pa.field("id", pa.int32(), nullable=True),
-    pa.field("name", pa.string(), nullable=True),
-])
+ARROW_SCHEMA = pa.schema(
+    [
+        pa.field("id", pa.int32(), nullable=True),
+        pa.field("name", pa.string(), nullable=True),
+    ]
+)
 
 
 def _batch(ids: list[int]) -> pa.Table:
@@ -104,9 +107,7 @@ def test_v3_append_twice_row_lineage_is_monotonic(v3_catalog: Catalog) -> None:
     assert running == tbl.metadata.next_row_id
 
 
-def test_v3_merge_append_does_not_double_count_existing_rows(
-    v3_catalog: Catalog, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_v3_merge_append_does_not_double_count_existing_rows(v3_catalog: Catalog, monkeypatch: pytest.MonkeyPatch) -> None:
     """Merge-append must actually MERGE manifests and must NOT double-count existing rows.
 
     This is the #3070 double-count regression guard. We instrument the merge manager so the
@@ -159,7 +160,7 @@ def test_v3_merge_append_does_not_double_count_existing_rows(
 
     # The merged manifests must tile [0, 9) exactly, with each data file's row range coherent.
     assigned = sorted(
-        ((m.first_row_id, m.existing_rows_count + m.added_rows_count) for m in data_manifests),
+        ((cast(int, m.first_row_id), cast(int, m.existing_rows_count) + cast(int, m.added_rows_count)) for m in data_manifests),
         key=lambda pair: pair[0],
     )
     cursor = 0
@@ -285,7 +286,7 @@ def test_v3_whole_file_delete_with_two_survivors_renumbers_none(v3_catalog: Cata
     tbl = v3_catalog.load_table("ns.t")
 
     assert tbl.metadata.next_row_id == 6, "no new row ids on a whole-file delete"
-    frids = sorted(triple[0] for triple in _data_file_row_ids(tbl))
+    frids = sorted(cast(int, triple[0]) for triple in _data_file_row_ids(tbl))
     # survivors must keep first_row_ids 0 and 4 (NOT renumbered to 0 and 2).
     assert frids == [0, 4], "survivors were re-numbered after deleting the middle file"
     actual_ids = sorted(row["id"] for row in tbl.scan().to_arrow().to_pylist())

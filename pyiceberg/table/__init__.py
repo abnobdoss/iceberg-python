@@ -2006,9 +2006,7 @@ class TableScan(BaseScan):
             )
 
         selected_data_fields = tuple(
-            field_name
-            for field_name in self.selected_fields
-            if _reserved_metadata_field(field_name, self.case_sensitive) is None
+            field_name for field_name in self.selected_fields if _reserved_metadata_field(field_name, self.case_sensitive) is None
         )
         if selected_data_fields:
             data_projection = current_schema.select(*selected_data_fields, case_sensitive=self.case_sensitive)
