@@ -475,6 +475,41 @@ def test_older_than_with_retain_last_keeps_newest_unprotected_floor(table_v2: Ta
     assert remaining_ids == {104, 105}
 
 
+def test_older_than_with_retain_last_intersection(table_v2: Table) -> None:
+    _prepare_table_with_snapshots(
+        table_v2,
+        [
+            (101, 1000),
+            (102, 2000),
+            (103, 3000),
+            (104, 4000),
+            (105, 5000),
+        ],
+    )
+    _configure_commit_to_apply_updates(table_v2)
+
+    table_v2.maintenance.expire_snapshots().older_than(datetime(1970, 1, 1, 0, 0, 2, 500000)).retain_last(2).commit()
+
+    remaining_ids = {snapshot.snapshot_id for snapshot in table_v2.metadata.snapshots}
+    assert remaining_ids == {103, 104, 105}
+
+
+def test_retain_last_tiebreak_uses_sequence_number(table_v2: Table) -> None:
+    _prepare_table_with_snapshots(
+        table_v2,
+        [
+            (102, 1000),
+            (101, 1000),
+        ],
+    )
+    _configure_commit_to_apply_updates(table_v2)
+
+    table_v2.maintenance.expire_snapshots().retain_last(1).commit()
+
+    remaining_ids = {snapshot.snapshot_id for snapshot in table_v2.metadata.snapshots}
+    assert remaining_ids == {101}
+
+
 def test_retain_last_keeps_protected_snapshots_without_counting_them(table_v2: Table) -> None:
     _prepare_table_with_snapshots(
         table_v2,

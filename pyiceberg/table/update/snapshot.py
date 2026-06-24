@@ -1064,20 +1064,25 @@ class ExpireSnapshots(UpdateTableMetadata["ExpireSnapshots"]):
         self._snapshot_ids_to_expire -= protected_ids
 
         if self._retain_last is not None:
+            standalone = len(self._snapshot_ids_to_expire) == 0
             unprotected_snapshots = sorted(
                 [
                     snapshot
                     for snapshot in self._transaction.table_metadata.snapshots
                     if snapshot.snapshot_id not in protected_ids
                 ],
-                key=lambda snapshot: (snapshot.timestamp_ms, snapshot.snapshot_id),
+                key=lambda snapshot: (
+                    snapshot.timestamp_ms,
+                    snapshot.sequence_number if snapshot.sequence_number is not None else -1,
+                ),
                 reverse=True,
             )
             keep_ids = {snapshot.snapshot_id for snapshot in unprotected_snapshots[: self._retain_last]}
             surplus_ids = {snapshot.snapshot_id for snapshot in unprotected_snapshots[self._retain_last :]}
 
-            self._snapshot_ids_to_expire |= surplus_ids
             self._snapshot_ids_to_expire -= keep_ids
+            if standalone:
+                self._snapshot_ids_to_expire |= surplus_ids
 
         update = RemoveSnapshotsUpdate(snapshot_ids=self._snapshot_ids_to_expire)
         self._updates += (update,)
@@ -1161,14 +1166,10 @@ class ExpireSnapshots(UpdateTableMetadata["ExpireSnapshots"]):
         """
         Retain the N most-recent unprotected snapshots.
 
-        Used alone, this expires all unprotected snapshots except the N most-recent by timestamp.
-        When combined with other expiration rules, such as older_than, this also acts as a
-        retention floor: the N most-recent unprotected snapshots are kept even if another rule
-        selected them for expiration. Protected snapshots, such as branch or tag heads and the
-        current snapshot, are always kept and are not counted toward N.
-
-        Retention is computed globally by snapshot timestamp, not per-branch ancestry; this differs
-        from the Java reference for non-linear histories and is a known limitation shared with older_than().
+        Used alone, this expires all unprotected snapshots except the newest N. When combined
+        with older_than/by_id/by_ids, the newest N unprotected snapshots are kept as a floor;
+        explicitly selected IDs in that newest N are silently kept. Protected snapshots are
+        always kept and are not counted toward N.
 
         Args:
             num_snapshots (int): Number of newest unprotected snapshots to retain.
