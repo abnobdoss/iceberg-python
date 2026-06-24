@@ -1316,6 +1316,15 @@ def test_type_promote_decimal_to_fixed_scale_with_wider_precision(table_v2: Tabl
     assert decimal_type.scale == 1
 
 
+def test_detect_invalid_promotion_decimal_scale_change(table_v2: Table) -> None:
+    # Per the Iceberg spec, decimal scale is fixed; only precision may grow.
+    current_schema = Schema(NestedField(field_id=1, name="aCol", field_type=DecimalType(precision=20, scale=1), required=False))
+    new_schema = Schema(NestedField(field_id=1, name="aCol", field_type=DecimalType(precision=22, scale=2), required=False))
+
+    with pytest.raises(ValidationError, match="Cannot change column type: aCol: decimal.20, 1. -> decimal.22, 2."):
+        _ = UpdateSchema(transaction=Transaction(table_v2), schema=current_schema).union_by_name(new_schema)._apply()
+
+
 def test_add_nested_structs(primitive_fields: NestedField, table_v2: Table) -> None:
     schema = Schema(
         NestedField(
