@@ -17,10 +17,11 @@
 from __future__ import annotations
 
 import itertools
+import logging
 import uuid
 from abc import abstractmethod
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import datetime
 from functools import cached_property
 from typing import TYPE_CHECKING, Generic
@@ -79,6 +80,10 @@ from pyiceberg.utils.properties import property_as_bool, property_as_int
 
 if TYPE_CHECKING:
     from pyiceberg.table import Transaction
+    from pyiceberg.table.metadata import TableMetadata
+
+
+logger = logging.getLogger(__name__)
 
 
 def _new_manifest_file_name(num: int, commit_uuid: uuid.UUID) -> str:
@@ -1039,13 +1044,17 @@ class ExpireSnapshots(UpdateTableMetadata["ExpireSnapshots"]):
 
     _updates: tuple[TableUpdate, ...]
     _requirements: tuple[TableRequirement, ...]
+    _io: FileIO
     _snapshot_ids_to_expire: set[int]
+    _clean_expired_files: bool
 
     def __init__(self, transaction: Transaction) -> None:
         super().__init__(transaction)
         self._updates = ()
         self._requirements = ()
+        self._io = transaction._table.io
         self._snapshot_ids_to_expire = set()
+        self._clean_expired_files = False
 
     def _commit(self) -> UpdatesAndRequirements:
         """
@@ -1063,6 +1072,126 @@ class ExpireSnapshots(UpdateTableMetadata["ExpireSnapshots"]):
         update = RemoveSnapshotsUpdate(snapshot_ids=self._snapshot_ids_to_expire)
         self._updates += (update,)
         return self._updates, self._requirements
+
+    def commit(self) -> None:
+        if not self._clean_expired_files or not self._snapshot_ids_to_expire:
+            super().commit()
+            return
+
+        if not self._transaction._autocommit:
+            super().commit()
+            logger.debug("Skipping expired-file cleanup for non-autocommit transaction; cleanup only runs on autocommit")
+            return
+
+        self._snapshot_ids_to_expire -= self._get_protected_snapshot_ids()
+        if not self._snapshot_ids_to_expire:
+            super().commit()
+            return
+
+        pre_commit_metadata = self._transaction.table_metadata
+        expired_snapshots = [
+            snapshot for snapshot in pre_commit_metadata.snapshots if snapshot.snapshot_id in self._snapshot_ids_to_expire
+        ]
+        expired_files = self._reachable_files(expired_snapshots, strict=False)
+        expired_files.update(self._statistics_paths(pre_commit_metadata, self._snapshot_ids_to_expire, belonging=True))
+
+        super().commit()
+
+        try:
+            surviving_files = self._reachable_files(self._transaction.table_metadata.snapshots, strict=True)
+        except Exception:
+            logger.warning(
+                "skipping expired-file cleanup: could not fully resolve surviving files",
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
+            return
+        surviving_files.update(
+            self._statistics_paths(self._transaction.table_metadata, self._snapshot_ids_to_expire, belonging=False)
+        )
+
+        for path in expired_files - surviving_files:
+            try:
+                self._io.delete(path)
+            except Exception:
+                logger.warning(
+                    "Failed to delete expired snapshot file %s",
+                    path,
+                    exc_info=logger.isEnabledFor(logging.DEBUG),
+                )
+
+    def clean_expired_files(self, clean: bool = True) -> ExpireSnapshots:
+        """Clean up files that are no longer reachable after expiring snapshots."""
+        self._clean_expired_files = clean
+        return self
+
+    def _reachable_files(self, snapshots: Iterable[Snapshot], *, strict: bool) -> set[str]:
+        reachable_files: set[str] = set()
+
+        for snapshot in snapshots:
+            reachable_files.add(snapshot.manifest_list)
+            try:
+                manifests = snapshot.manifests(self._io)
+            except Exception:
+                if strict:
+                    raise
+                logger.debug(
+                    "Skipping manifest list while collecting reachable files for snapshot %s: %s",
+                    snapshot.snapshot_id,
+                    snapshot.manifest_list,
+                    exc_info=logger.isEnabledFor(logging.DEBUG),
+                )
+                continue
+
+            for manifest in manifests:
+                reachable_files.add(manifest.manifest_path)
+                try:
+                    entries = manifest.fetch_manifest_entry(io=self._io, discard_deleted=False)
+                except Exception:
+                    if strict:
+                        raise
+                    logger.debug(
+                        "Skipping manifest while collecting reachable files for snapshot %s: %s",
+                        snapshot.snapshot_id,
+                        manifest.manifest_path,
+                        exc_info=logger.isEnabledFor(logging.DEBUG),
+                    )
+                    continue
+
+                reachable_files.update(entry.data_file.file_path for entry in entries)
+
+        return reachable_files
+
+    @staticmethod
+    def _statistics_paths(metadata: TableMetadata, snapshot_ids: set[int], *, belonging: bool) -> set[str]:
+        statistics_paths: set[str] = set()
+
+        try:
+            statistics = getattr(metadata, "statistics", None) or ()
+            partition_statistics = getattr(metadata, "partition_statistics", None) or ()
+        except Exception:
+            logger.debug(
+                "Skipping statistics while collecting reachable files",
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
+            return statistics_paths
+
+        try:
+            for stat in itertools.chain(statistics, partition_statistics):
+                try:
+                    if (stat.snapshot_id in snapshot_ids) == belonging and stat.statistics_path:
+                        statistics_paths.add(stat.statistics_path)
+                except Exception:
+                    logger.debug(
+                        "Skipping statistics file while collecting reachable files",
+                        exc_info=logger.isEnabledFor(logging.DEBUG),
+                    )
+        except Exception:
+            logger.debug(
+                "Skipping statistics while collecting reachable files",
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
+
+        return statistics_paths
 
     def _get_protected_snapshot_ids(self) -> set[int]:
         """

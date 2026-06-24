@@ -16,14 +16,267 @@
 # under the License.
 import threading
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock, Mock
+from pathlib import Path
+from unittest.mock import MagicMock, Mock, patch
+from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
+import pyarrow as pa
 import pytest
 
-from pyiceberg.table import CommitTableResponse, Table
-from pyiceberg.table.update import RemoveSnapshotsUpdate, update_table_metadata
+from pyiceberg.catalog.sql import SqlCatalog
+from pyiceberg.table import CommitTableResponse, Table, Transaction
+from pyiceberg.table.snapshots import Snapshot
+from pyiceberg.table.statistics import BlobMetadata, PartitionStatisticsFile, StatisticsFile
+from pyiceberg.table.update import RemoveSnapshotsUpdate, SetPartitionStatisticsUpdate, update_table_metadata
 from pyiceberg.table.update.snapshot import ExpireSnapshots
+
+
+def _sql_catalog(tmp_path: Path) -> SqlCatalog:
+    catalog = SqlCatalog(
+        "test",
+        uri=f"sqlite:///{tmp_path}/pyiceberg_catalog.db",
+        warehouse=f"file://{tmp_path}",
+    )
+    catalog.create_namespace_if_not_exists("default")
+    return catalog
+
+
+def _arrow_table(rows: list[dict[str, object]]) -> pa.Table:
+    return pa.Table.from_pylist(
+        rows,
+        schema=pa.schema([pa.field("id", pa.int64()), pa.field("data", pa.string())]),
+    )
+
+
+def _local_path(location: str) -> Path:
+    parsed = urlparse(location)
+    if parsed.scheme == "file":
+        return Path(unquote(parsed.path))
+    return Path(location)
+
+
+def _touch_file(location: str) -> None:
+    path = _local_path(location)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"")
+
+
+def _statistics_file(snapshot_id: int, statistics_path: str) -> StatisticsFile:
+    return StatisticsFile(
+        snapshot_id=snapshot_id,
+        statistics_path=statistics_path,
+        file_size_in_bytes=0,
+        file_footer_size_in_bytes=0,
+        blob_metadata=[
+            BlobMetadata(
+                type="apache-datasketches-theta-v1",
+                snapshot_id=snapshot_id,
+                sequence_number=0,
+                fields=[1],
+            )
+        ],
+    )
+
+
+def _partition_statistics_file(snapshot_id: int, statistics_path: str) -> PartitionStatisticsFile:
+    return PartitionStatisticsFile(
+        snapshot_id=snapshot_id,
+        statistics_path=statistics_path,
+        file_size_in_bytes=0,
+    )
+
+
+def _data_file_paths(table: Table, snapshot_id: int) -> set[str]:
+    snapshot = table.metadata.snapshot_by_id(snapshot_id)
+    assert snapshot is not None
+    return {
+        entry.data_file.file_path
+        for manifest in snapshot.manifests(table.io)
+        for entry in manifest.fetch_manifest_entry(io=table.io, discard_deleted=True)
+    }
+
+
+def _non_current_snapshot_ids(table: Table) -> list[int]:
+    current_snapshot = table.metadata.current_snapshot()
+    assert current_snapshot is not None
+    return [snapshot.snapshot_id for snapshot in table.metadata.snapshots if snapshot.snapshot_id != current_snapshot.snapshot_id]
+
+
+def _create_overwritten_table(catalog: SqlCatalog, identifier: str) -> tuple[Table, int, str]:
+    table = catalog.create_table(identifier, schema=_arrow_table([{"id": 1, "data": "before"}]).schema)
+    table.append(_arrow_table([{"id": 1, "data": "before"}]))
+    first_snapshot = table.metadata.current_snapshot()
+    assert first_snapshot is not None
+    first_snapshot_data_files = _data_file_paths(table, first_snapshot.snapshot_id)
+    assert len(first_snapshot_data_files) == 1
+
+    table.overwrite(_arrow_table([{"id": 2, "data": "after"}]))
+
+    return table, first_snapshot.snapshot_id, next(iter(first_snapshot_data_files))
+
+
+def test_expire_snapshots_clean_expired_files_deletes_unreferenced(tmp_path: Path) -> None:
+    catalog = _sql_catalog(tmp_path)
+
+    control_table, _, control_data_file = _create_overwritten_table(catalog, "default.control_table")
+    control_table.maintenance.expire_snapshots().by_ids(_non_current_snapshot_ids(control_table)).commit()
+    assert _local_path(control_data_file).exists()
+
+    table, first_snapshot_id, first_data_file = _create_overwritten_table(catalog, "default.clean_table")
+    snapshot_ids_to_expire = _non_current_snapshot_ids(table)
+    assert first_snapshot_id in snapshot_ids_to_expire
+
+    table.maintenance.expire_snapshots().by_ids(snapshot_ids_to_expire).clean_expired_files().commit()
+
+    assert not _local_path(first_data_file).exists()
+    assert table.scan().to_arrow().to_pylist() == [{"id": 2, "data": "after"}]
+
+
+def test_expire_snapshots_clean_expired_files_keeps_shared_files(tmp_path: Path) -> None:
+    catalog = _sql_catalog(tmp_path)
+    table = catalog.create_table("default.shared_table", schema=_arrow_table([{"id": 1, "data": "one"}]).schema)
+
+    table.append(_arrow_table([{"id": 1, "data": "one"}]))
+    first_snapshot = table.metadata.current_snapshot()
+    assert first_snapshot is not None
+    first_snapshot_data_files = _data_file_paths(table, first_snapshot.snapshot_id)
+    assert len(first_snapshot_data_files) == 1
+    shared_data_file = next(iter(first_snapshot_data_files))
+
+    table.append(_arrow_table([{"id": 2, "data": "two"}]))
+
+    table.maintenance.expire_snapshots().by_id(first_snapshot.snapshot_id).clean_expired_files().commit()
+
+    assert _local_path(shared_data_file).exists()
+    assert sorted(table.scan().to_arrow().to_pylist(), key=lambda row: row["id"]) == [
+        {"id": 1, "data": "one"},
+        {"id": 2, "data": "two"},
+    ]
+
+
+def test_expire_snapshots_clean_expired_files_keeps_files_referenced_only_by_tag(tmp_path: Path) -> None:
+    """A file reachable only from a tagged snapshot (not the current lineage) must survive expiration."""
+    catalog = _sql_catalog(tmp_path)
+    table = catalog.create_table("default.tag_shared_table", schema=_arrow_table([{"id": 1, "data": "one"}]).schema)
+
+    # First snapshot writes the shared file; it is unprotected and will be expired.
+    table.append(_arrow_table([{"id": 1, "data": "one"}]))
+    expiring_snapshot = table.metadata.current_snapshot()
+    assert expiring_snapshot is not None
+    shared_data_files = _data_file_paths(table, expiring_snapshot.snapshot_id)
+    assert len(shared_data_files) == 1
+    shared_data_file = next(iter(shared_data_files))
+
+    # Second snapshot still references the shared file; we tag it so it stays alive.
+    table.append(_arrow_table([{"id": 2, "data": "two"}]))
+    tagged_snapshot = table.metadata.current_snapshot()
+    assert tagged_snapshot is not None
+    assert shared_data_file in _data_file_paths(table, tagged_snapshot.snapshot_id)
+    table.manage_snapshots().create_tag(tagged_snapshot.snapshot_id, "keep_tag").commit()
+
+    # Overwrite drops the shared file from the current lineage; only the tag still references it.
+    table.overwrite(_arrow_table([{"id": 99, "data": "overwritten"}]))
+    current_snapshot = table.metadata.current_snapshot()
+    assert current_snapshot is not None
+    assert shared_data_file not in _data_file_paths(table, current_snapshot.snapshot_id)
+
+    # Expiring the first snapshot must NOT delete the file the tag still references.
+    table.maintenance.expire_snapshots().by_id(expiring_snapshot.snapshot_id).clean_expired_files().commit()
+
+    assert _local_path(shared_data_file).exists()
+    assert table.metadata.snapshot_by_id(expiring_snapshot.snapshot_id) is None
+    assert table.metadata.snapshot_by_id(tagged_snapshot.snapshot_id) is not None
+    # The tagged snapshot remains fully readable from the file that survived.
+    assert sorted(table.scan(snapshot_id=tagged_snapshot.snapshot_id).to_arrow().to_pylist(), key=lambda row: row["id"]) == [
+        {"id": 1, "data": "one"},
+        {"id": 2, "data": "two"},
+    ]
+
+
+def test_expire_snapshots_clean_expired_files_deletes_statistics_files(tmp_path: Path) -> None:
+    catalog = _sql_catalog(tmp_path)
+    table, first_snapshot_id, _ = _create_overwritten_table(catalog, "default.clean_stats_table")
+    current_snapshot = table.metadata.current_snapshot()
+    assert current_snapshot is not None
+
+    table_location = table.location().rstrip("/")
+    expired_table_statistics = f"{table_location}/metadata/expired-table-stats.puffin"
+    surviving_table_statistics = f"{table_location}/metadata/surviving-table-stats.puffin"
+    expired_partition_statistics = f"{table_location}/metadata/expired-partition-stats.puffin"
+    surviving_partition_statistics = f"{table_location}/metadata/surviving-partition-stats.puffin"
+
+    for location in (
+        expired_table_statistics,
+        surviving_table_statistics,
+        expired_partition_statistics,
+        surviving_partition_statistics,
+    ):
+        _touch_file(location)
+
+    with table.update_statistics() as update:
+        update.set_statistics(_statistics_file(first_snapshot_id, expired_table_statistics))
+        update.set_statistics(_statistics_file(current_snapshot.snapshot_id, surviving_table_statistics))
+
+    table.transaction()._apply(
+        (
+            SetPartitionStatisticsUpdate(
+                partition_statistics=_partition_statistics_file(first_snapshot_id, expired_partition_statistics)
+            ),
+            SetPartitionStatisticsUpdate(
+                partition_statistics=_partition_statistics_file(current_snapshot.snapshot_id, surviving_partition_statistics)
+            ),
+        )
+    ).commit_transaction()
+
+    table.maintenance.expire_snapshots().by_id(first_snapshot_id).clean_expired_files().commit()
+
+    assert not _local_path(expired_table_statistics).exists()
+    assert not _local_path(expired_partition_statistics).exists()
+    assert _local_path(surviving_table_statistics).exists()
+    assert _local_path(surviving_partition_statistics).exists()
+
+
+def test_expire_snapshots_clean_skips_deletion_when_surviving_unresolvable(tmp_path: Path) -> None:
+    catalog = _sql_catalog(tmp_path)
+    table, first_snapshot_id, first_data_file = _create_overwritten_table(catalog, "default.unresolvable_survivor_table")
+    current_snapshot = table.metadata.current_snapshot()
+    assert current_snapshot is not None
+    original_manifests = Snapshot.manifests
+
+    def manifests(snapshot: Snapshot, *args: object, **kwargs: object) -> object:
+        if snapshot.snapshot_id == current_snapshot.snapshot_id:
+            raise OSError("surviving manifest list is unavailable")
+        return original_manifests(snapshot, *args, **kwargs)
+
+    with (
+        patch.object(table.io, "delete", wraps=table.io.delete) as delete,
+        patch.object(Snapshot, "manifests", autospec=True, side_effect=manifests),
+    ):
+        table.maintenance.expire_snapshots().by_id(first_snapshot_id).clean_expired_files().commit()
+
+    delete.assert_not_called()
+    assert _local_path(first_data_file).exists()
+    assert table.scan().to_arrow().to_pylist() == [{"id": 2, "data": "after"}]
+
+
+def test_expire_snapshots_clean_noop_on_non_autocommit_transaction(tmp_path: Path) -> None:
+    catalog = _sql_catalog(tmp_path)
+    table, first_snapshot_id, first_data_file = _create_overwritten_table(catalog, "default.non_autocommit_table")
+    transaction = Transaction(table, autocommit=False)
+    expire_snapshots = ExpireSnapshots(transaction).by_id(first_snapshot_id).clean_expired_files()
+
+    with patch.object(expire_snapshots._io, "delete") as delete:
+        expire_snapshots.commit()
+
+    delete.assert_not_called()
+    assert _local_path(first_data_file).exists()
+    assert table.metadata.snapshot_by_id(first_snapshot_id) is not None
+    assert transaction.table_metadata.snapshot_by_id(first_snapshot_id) is None
+    assert any(
+        isinstance(update, RemoveSnapshotsUpdate) and update.snapshot_ids == [first_snapshot_id]
+        for update in transaction._updates
+    )
 
 
 def test_cannot_expire_protected_head_snapshot(table_v2: Table) -> None:
