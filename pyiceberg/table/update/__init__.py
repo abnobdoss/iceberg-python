@@ -479,7 +479,9 @@ def _(update: AddSnapshotUpdate, base_metadata: TableMetadata, context: _TableMe
             raise ValueError("Cannot add a snapshot when table next-row-id is null")
         if update.snapshot.added_rows is None:
             raise ValueError("Cannot add snapshot without added rows")
-        metadata_updates["next_row_id"] = base_metadata.next_row_id + update.snapshot.added_rows
+        if update.snapshot.first_row_id is None:
+            raise ValueError("Cannot add snapshot without first row id")
+        metadata_updates["next_row_id"] = update.snapshot.first_row_id + update.snapshot.added_rows
 
     return base_metadata.model_copy(update=metadata_updates)
 

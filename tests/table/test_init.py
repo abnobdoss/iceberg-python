@@ -1781,7 +1781,7 @@ def test_add_snapshot_update_updates_next_row_id(table_v3: Table) -> None:
     )
 
     new_metadata = update_table_metadata(table_v3.metadata, (AddSnapshotUpdate(snapshot=new_snapshot),))
-    assert new_metadata.next_row_id == 11
+    assert new_metadata.next_row_id == 12
 
 
 def model_roundtrips(model: BaseModel) -> bool:

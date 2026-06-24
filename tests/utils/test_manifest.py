@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 # pylint: disable=redefined-outer-name,arguments-renamed,fixme
+from copy import copy
 from tempfile import TemporaryDirectory
 
 import fastavro
@@ -50,6 +51,35 @@ from pyiceberg.types import IntegerType, NestedField
 def clear_global_manifests_cache() -> None:
     # Clear the global cache before each test
     _manifest_cache.clear()
+
+
+def test_manifest_file_copy_has_independent_data() -> None:
+    manifest_file = ManifestFile.from_args(
+        _table_format_version=3,
+        manifest_path="s3://bucket/table/metadata/m0.avro",
+        manifest_length=10,
+        partition_spec_id=0,
+        content=ManifestContent.DATA,
+        sequence_number=1,
+        min_sequence_number=1,
+        added_snapshot_id=1,
+        added_files_count=1,
+        existing_files_count=0,
+        deleted_files_count=0,
+        added_rows_count=3,
+        existing_rows_count=0,
+        deleted_rows_count=0,
+        partitions=[],
+        key_metadata=None,
+        first_row_id=None,
+    )
+
+    wrapped = copy(manifest_file)
+    wrapped.first_row_id = 5
+    wrapped.min_sequence_number = 9
+
+    assert manifest_file.first_row_id is None
+    assert manifest_file.min_sequence_number == 1
 
 
 def _verify_metadata_with_fastavro(avro_file: str, expected_metadata: dict[str, str]) -> None:
@@ -757,6 +787,7 @@ def test_manifest_cache_deduplicates_manifest_files() -> None:
             avro_compression="zstandard",
         ) as list_writer:
             list_writer.add_manifests([manifest_file1])
+        manifest_file1 = _manifests(io, manifest_list1_path)[0]
 
         # Create manifest list 2: contains manifest1 and manifest2 (overlapping manifest1)
         manifest_list2_path = f"{tmp_dir}/manifest-list2.avro"
@@ -769,6 +800,7 @@ def test_manifest_cache_deduplicates_manifest_files() -> None:
             avro_compression="zstandard",
         ) as list_writer:
             list_writer.add_manifests([manifest_file1, manifest_file2])
+        manifest_file1, manifest_file2 = _manifests(io, manifest_list2_path)
 
         # Create manifest list 3: contains all three manifests (overlapping manifest1 and manifest2)
         manifest_list3_path = f"{tmp_dir}/manifest-list3.avro"
@@ -868,6 +900,7 @@ def test_manifest_cache_efficiency_with_many_overlapping_lists() -> None:
             ) as list_writer:
                 list_writer.add_manifests(manifest_files[: i + 1])
             manifest_list_paths.append(list_path)
+            manifest_files[: i + 1] = _manifests(io, list_path)
 
         # Read all manifest lists
         all_results = []

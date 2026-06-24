@@ -899,6 +899,23 @@ class ManifestFile(Record):
         else:
             self._data[15] = value
 
+    def __copy__(self) -> ManifestFile:
+        cls = self.__class__
+        new = cls.__new__(cls)
+        new._data = list(self._data)
+        instance_dict = getattr(self, "__dict__", None)
+        if instance_dict:
+            new.__dict__.update(instance_dict)
+        for klass in cls.__mro__:
+            slots = getattr(klass, "__slots__", ())
+            if isinstance(slots, str):
+                slots = (slots,)
+            for slot in slots:
+                if slot in {"_data", "__dict__", "__weakref__"} or not hasattr(self, slot):
+                    continue
+                setattr(new, slot, getattr(self, slot))
+        return new
+
     def has_added_files(self) -> bool:
         return self.added_files_count is None or self.added_files_count > 0
 

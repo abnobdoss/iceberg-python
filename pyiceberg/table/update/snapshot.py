@@ -652,6 +652,7 @@ class _OverwriteFiles(_SnapshotProducer["_OverwriteFiles"]):
         """Determine if there are any existing manifest files."""
         existing_files = []
 
+        is_v3 = self._transaction.table_metadata.format_version >= 3
         manifest_evaluators: dict[int, Callable[[ManifestFile], bool]] = KeyDefaultDict(self._build_manifest_evaluator)
         if snapshot := self._transaction.table_metadata.snapshot_by_name(name=self._target_branch):
             for manifest_file in snapshot.manifests(io=self._io):
@@ -660,14 +661,9 @@ class _OverwriteFiles(_SnapshotProducer["_OverwriteFiles"]):
                     existing_files.append(manifest_file)
                     continue
 
-                entries_to_write: set[ManifestEntry] = set()
-                found_deleted_entries: set[ManifestEntry] = set()
-
-                for entry in manifest_file.fetch_manifest_entry(io=self._io, discard_deleted=True):
-                    if entry.data_file in self._deleted_data_files:
-                        found_deleted_entries.add(entry)
-                    else:
-                        entries_to_write.add(entry)
+                is_v3_data_manifest = is_v3 and manifest_file.content == ManifestContent.DATA
+                live_entries = manifest_file.fetch_manifest_entry(io=self._io, discard_deleted=True)
+                found_deleted_entries = [entry for entry in live_entries if entry.data_file in self._deleted_data_files]
 
                 # Is the intercept the empty set?
                 if len(found_deleted_entries) == 0:
@@ -675,22 +671,49 @@ class _OverwriteFiles(_SnapshotProducer["_OverwriteFiles"]):
                     continue
 
                 # Delete all files from manifest
-                if len(entries_to_write) == 0:
+                if len(found_deleted_entries) == len(live_entries):
                     continue
 
-                # We have to rewrite the manifest file without the deleted data files
-                with self.new_manifest_writer(self.spec(manifest_file.partition_spec_id)) as writer:
-                    for entry in entries_to_write:
-                        writer.add_entry(
+                entries_to_write: list[ManifestEntry] = []
+                row_id_cursor: int | None = manifest_file.first_row_id if is_v3_data_manifest else None
+                for entry in live_entries:
+                    materialized_data_file = entry.data_file
+                    if is_v3_data_manifest:
+                        explicit_first_row_id = materialized_data_file.first_row_id
+                        if explicit_first_row_id is not None:
+                            row_id_cursor = explicit_first_row_id
+                        if entry.data_file not in self._deleted_data_files:
+                            if row_id_cursor is None:
+                                raise NotImplementedError(
+                                    "Cannot perform a v3 overwrite that preserves row lineage: the source "
+                                    "manifest is missing a first_row_id and the surviving data file "
+                                    f"{materialized_data_file.file_path} has no explicit field-142 "
+                                    "first_row_id."
+                                )
+                            if explicit_first_row_id is None:
+                                materialized_data_file = copy(materialized_data_file)
+                                materialized_data_file.first_row_id = row_id_cursor
+                    if entry.data_file not in self._deleted_data_files:
+                        entries_to_write.append(
                             ManifestEntry.from_args(
                                 status=ManifestEntryStatus.EXISTING,
                                 snapshot_id=entry.snapshot_id,
                                 sequence_number=entry.sequence_number,
                                 file_sequence_number=entry.file_sequence_number,
-                                data_file=entry.data_file,
+                                data_file=materialized_data_file,
                             )
                         )
-                existing_files.append(writer.to_manifest_file())
+                    if is_v3_data_manifest and row_id_cursor is not None:
+                        row_id_cursor += materialized_data_file.record_count
+
+                # We have to rewrite the manifest file without the deleted data files
+                with self.new_manifest_writer(self.spec(manifest_file.partition_spec_id)) as writer:
+                    for entry in entries_to_write:
+                        writer.add_entry(entry)
+                rewritten_manifest = writer.to_manifest_file()
+                if is_v3_data_manifest:
+                    rewritten_manifest.first_row_id = manifest_file.first_row_id
+                existing_files.append(rewritten_manifest)
 
         return existing_files
 
@@ -832,7 +855,42 @@ class _ManifestMergeManager(Generic[U]):
 
         with self._snapshot_producer.new_manifest_writer(spec=self._snapshot_producer.spec(spec_id)) as writer:
             for manifest in ordered_bin:
+                is_v3_data_manifest = format_version >= 3 and manifest.content == ManifestContent.DATA
+                row_id_cursor: int | None = manifest.first_row_id if is_v3_data_manifest else None
                 for entry in self._snapshot_producer.fetch_manifest_entry(manifest=manifest, discard_deleted=False):
+                    if is_v3_data_manifest:
+                        materialized_data_file = entry.data_file
+                        explicit_first_row_id = materialized_data_file.first_row_id
+                        if explicit_first_row_id is not None:
+                            row_id_cursor = explicit_first_row_id
+                        carries_existing_rows = not (
+                            entry.status == ManifestEntryStatus.ADDED
+                            and entry.snapshot_id == self._snapshot_producer.snapshot_id
+                        )
+                        writes_existing_or_deleted = (
+                            carries_existing_rows
+                            and (
+                                entry.status != ManifestEntryStatus.DELETED
+                                or entry.snapshot_id == self._snapshot_producer.snapshot_id
+                            )
+                        )
+                        if writes_existing_or_deleted and explicit_first_row_id is None:
+                            if row_id_cursor is None:
+                                raise NotImplementedError(
+                                    "Cannot merge v3 manifests while preserving row lineage: the source "
+                                    "manifest is missing a first_row_id and data file "
+                                    f"{materialized_data_file.file_path} has no explicit field-142 "
+                                    "first_row_id."
+                                )
+                            materialized_data_file = copy(materialized_data_file)
+                            materialized_data_file.first_row_id = row_id_cursor
+                            entry = ManifestEntry.from_args(
+                                status=entry.status,
+                                snapshot_id=entry.snapshot_id,
+                                sequence_number=entry.sequence_number,
+                                file_sequence_number=entry.file_sequence_number,
+                                data_file=materialized_data_file,
+                            )
                     if entry.status == ManifestEntryStatus.DELETED and entry.snapshot_id == self._snapshot_producer.snapshot_id:
                         #  only files deleted by this snapshot should be added to the new manifest
                         writer.delete(entry)
@@ -842,6 +900,8 @@ class _ManifestMergeManager(Generic[U]):
                     elif entry.status != ManifestEntryStatus.DELETED:
                         # add all non-deleted files from the old manifest as existing files
                         writer.existing(entry)
+                    if is_v3_data_manifest and row_id_cursor is not None:
+                        row_id_cursor += entry.data_file.record_count
 
         merged_manifest = writer.to_manifest_file()
         inherited_first_row_ids = [

@@ -30,9 +30,12 @@ import pytest
 
 from pyiceberg.catalog import Catalog
 from pyiceberg.catalog.memory import InMemoryCatalog
-from pyiceberg.manifest import ManifestContent
+from pyiceberg.manifest import DataFile, ManifestContent
 from pyiceberg.schema import Schema
+from pyiceberg.table import Table
 from pyiceberg.table.metadata import TableMetadataUtil, TableMetadataV3
+from pyiceberg.table.snapshots import Operation, Snapshot, Summary
+from pyiceberg.table.update import AddSnapshotUpdate, update_table_metadata
 from pyiceberg.types import IntegerType, NestedField, StringType
 
 
@@ -172,6 +175,29 @@ def test_v3_merge_append_does_not_double_count_existing_rows(
     actual_ids = sorted(row["id"] for row in tbl.scan().to_arrow().to_pylist())
     assert actual_ids == [1, 2, 3, 4, 5, 6, 7, 8, 9]
 
+    tbl.append(_batch([]))
+    tbl = v3_catalog.load_table("ns.t")
+
+    snap = tbl.metadata.current_snapshot()
+    assert snap is not None
+    merged_manifests = [m for m in snap.manifests(tbl.io) if m.content == ManifestContent.DATA and m.existing_files_count]
+    assert len(merged_manifests) == 1
+    explicit_ranges = [
+        (
+            entry.data_file.first_row_id,
+            entry.data_file.record_count,
+        )
+        for manifest in merged_manifests
+        for entry in manifest.fetch_manifest_entry(tbl.io, discard_deleted=True)
+    ]
+    assert all(first_row_id is not None for first_row_id, _ in explicit_ranges)
+    explicit_ranges = sorted(explicit_ranges)
+    cursor = 0
+    for first_row_id, rows in explicit_ranges:
+        assert first_row_id == cursor
+        cursor += rows
+    assert cursor == 9
+
 
 def test_v3_manifest_carries_first_row_id(v3_catalog: Catalog) -> None:
     """The data manifest in the manifest list must be assigned a first_row_id per spec."""
@@ -219,6 +245,86 @@ def _data_file_row_ids(tbl: object) -> list[tuple[int | None, int | None, int]]:
         for entry in m.fetch_manifest_entry(tbl.io, discard_deleted=True):  # type: ignore[attr-defined]
             out.append((m.first_row_id, entry.data_file.first_row_id, entry.data_file.record_count))
     return out
+
+
+def _data_files(tbl: Table) -> list[DataFile]:
+    snap = tbl.metadata.current_snapshot()
+    assert snap is not None
+    return [
+        entry.data_file
+        for manifest in snap.manifests(tbl.io)
+        if manifest.content == ManifestContent.DATA
+        for entry in manifest.fetch_manifest_entry(tbl.io, discard_deleted=True)
+    ]
+
+
+def _append_data_files_in_one_manifest(tbl: Table, id_groups: list[list[int]]) -> list[DataFile]:
+    import itertools
+    import uuid
+
+    from pyiceberg.io.pyarrow import _dataframe_to_data_files
+
+    data_files: list[DataFile] = []
+    with tbl.transaction() as txn:
+        with txn.update_snapshot().fast_append() as fast_append:
+            for ids in id_groups:
+                for data_file in _dataframe_to_data_files(
+                    io=tbl.io,
+                    df=_batch(ids),
+                    table_metadata=txn.table_metadata,
+                    write_uuid=uuid.uuid4(),
+                    counter=itertools.count(),
+                ):
+                    data_files.append(data_file)
+                    fast_append.append_data_file(data_file)
+    return data_files
+
+
+def test_v3_overwrite_delete_in_shared_manifest_preserves_survivor_row_ids(v3_catalog: Catalog) -> None:
+    v3_catalog.create_namespace("ns")
+    tbl = v3_catalog.create_table("ns.t", schema=SCHEMA, properties={"format-version": "3"})
+
+    _append_data_files_in_one_manifest(tbl, [[0, 1, 2], [100, 101, 102]])
+    tbl = v3_catalog.load_table("ns.t")
+    first_file = _data_files(tbl)[0]
+    assert tbl.metadata.next_row_id == 6
+    assert [m[0] for m in _data_file_row_ids(tbl)] == [0, 0]
+
+    with tbl.transaction() as txn:
+        with txn.update_snapshot().overwrite() as overwrite:
+            overwrite.delete_data_file(first_file)
+    tbl = v3_catalog.load_table("ns.t")
+
+    assert tbl.metadata.next_row_id == 6
+    overwrite_snap = tbl.metadata.current_snapshot()
+    assert overwrite_snap is not None
+    assert overwrite_snap.added_rows == 0
+
+    surviving = _data_file_row_ids(tbl)
+    assert len(surviving) == 1
+    manifest_frid, datafile_frid, rows = surviving[0]
+    assert rows == 3
+    assert manifest_frid == 0
+    assert datafile_frid == 3
+    assert sorted(row["id"] for row in tbl.scan().to_arrow().to_pylist()) == [100, 101, 102]
+
+
+def test_v3_overwrite_delete_fails_when_survivor_row_id_cannot_be_preserved(v3_catalog: Catalog) -> None:
+    v3_catalog.create_namespace("ns")
+    tbl = v3_catalog.create_table("ns.t", schema=SCHEMA, properties={"format-version": "3"})
+
+    _append_data_files_in_one_manifest(tbl, [[0, 1, 2], [100, 101, 102]])
+    tbl = v3_catalog.load_table("ns.t")
+    first_file = _data_files(tbl)[0]
+    snap = tbl.metadata.current_snapshot()
+    assert snap is not None
+    data_manifest = next(m for m in snap.manifests(tbl.io) if m.content == ManifestContent.DATA)
+    data_manifest.first_row_id = None  # type: ignore[assignment]
+
+    with pytest.raises(NotImplementedError, match="row lineage"):
+        with tbl.transaction() as txn:
+            with txn.update_snapshot().overwrite() as overwrite:
+                overwrite.delete_data_file(first_file)
 
 
 def test_v3_whole_file_delete_does_not_renumber_surviving_rows(v3_catalog: Catalog) -> None:
@@ -407,3 +513,24 @@ def test_v3_upgrade_from_v2_seeds_next_row_id(tmp_path: Path) -> None:
     assert snap.first_row_id == 0
     assert snap.added_rows == 3
     assert tbl.metadata.next_row_id == 3
+
+
+def test_v3_add_snapshot_update_advances_next_row_id_from_snapshot_first_row_id(v3_catalog: Catalog) -> None:
+    v3_catalog.create_namespace("ns")
+    tbl = v3_catalog.create_table("ns.t", schema=SCHEMA, properties={"format-version": "3"})
+    assert tbl.metadata.next_row_id == 0
+
+    snapshot = Snapshot(
+        snapshot_id=25,
+        parent_snapshot_id=None,
+        sequence_number=1,
+        timestamp_ms=1602638593590,
+        manifest_list="s3:/a/b/c.avro",
+        summary=Summary(Operation.APPEND),
+        schema_id=tbl.metadata.current_schema_id,
+        first_row_id=tbl.metadata.next_row_id,
+        added_rows=4,
+    )
+
+    new_metadata = update_table_metadata(tbl.metadata, (AddSnapshotUpdate(snapshot=snapshot),))
+    assert new_metadata.next_row_id == 4
