@@ -15,14 +15,26 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Pure-python encoder and decoder for the Parquet Variant binary format."""
+"""Pure-python encoder and decoder for the Parquet Variant binary format.
+
+This implements only the non-shredded (metadata + value) Variant encoding. Shredded
+Variant and Arrow-native interop are not supported here; reading/writing Variant columns
+through Arrow is blocked on Arrow issues #45937, #50131, and #50132. ``VariantType`` is
+intentionally not registered with the Arrow schema visitors, so converting a schema that
+contains a Variant to Arrow raises rather than silently producing wrong data.
+"""
 
 from __future__ import annotations
 
 import struct
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 
 _METADATA_VERSION = 1
+
+_EPOCH_DATE = date(1970, 1, 1)
+_EPOCH_DATETIME_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 _BASIC_TYPE_PRIMITIVE = 0
 _BASIC_TYPE_SHORT_STRING = 1
@@ -37,7 +49,19 @@ _PRIMITIVE_INT16 = 4
 _PRIMITIVE_INT32 = 5
 _PRIMITIVE_INT64 = 6
 _PRIMITIVE_DOUBLE = 7
+_PRIMITIVE_DECIMAL4 = 8
+_PRIMITIVE_DECIMAL8 = 9
+_PRIMITIVE_DECIMAL16 = 10
+_PRIMITIVE_DATE = 11
+_PRIMITIVE_TIMESTAMP_TZ = 12
+_PRIMITIVE_TIMESTAMP_NTZ = 13
+_PRIMITIVE_FLOAT = 14
+_PRIMITIVE_BINARY = 15
 _PRIMITIVE_STRING = 16
+
+_MAX_DECIMAL_SCALE = 38
+_MAX_INT128 = (1 << 127) - 1
+_MIN_INT128 = -(1 << 127)
 
 _MAX_UINT32 = (1 << 32) - 1
 _MIN_INT8 = -(1 << 7)
@@ -86,7 +110,7 @@ def _collect_field_names(value: Any, field_names: set[str]) -> None:
     elif isinstance(value, list):
         for child in value:
             _collect_field_names(child, field_names)
-    elif value is None or isinstance(value, (bool, int, float, str)):
+    elif value is None or isinstance(value, (bool, int, float, str, bytes, Decimal, date, datetime)):
         return
     else:
         raise ValueError(f"Unsupported variant value: {value!r}")
@@ -96,7 +120,7 @@ def _encode_metadata(dictionary_strings: list[str]) -> bytes:
     encoded_strings = [value.encode("utf-8") for value in dictionary_strings]
     dictionary_bytes = b"".join(encoded_strings)
     offset_size = _unsigned_width(max(len(dictionary_strings), len(dictionary_bytes)))
-    header = _METADATA_VERSION | 0x10 | ((offset_size - 1) << 5)
+    header = _METADATA_VERSION | 0x10 | ((offset_size - 1) << 6)
 
     offsets = [0]
     offset = 0
@@ -119,13 +143,13 @@ def _decode_metadata(metadata_bytes: bytes) -> list[str]:
         raise ValueError("Variant metadata is empty")
 
     header = metadata_bytes[0]
-    if header & 0x80:
+    if header & 0x20:
         raise ValueError("Variant metadata reserved bit is set")
     version = header & 0x0F
     if version != _METADATA_VERSION:
         raise ValueError(f"Unsupported variant metadata version: {version}")
 
-    offset_size = ((header >> 5) & 0x03) + 1
+    offset_size = ((header >> 6) & 0x03) + 1
     offset = 1
     dictionary_size, offset = _read_unsigned(metadata_bytes, offset, offset_size)
 
@@ -136,14 +160,14 @@ def _decode_metadata(metadata_bytes: bytes) -> list[str]:
 
     if not offsets or offsets[0] != 0:
         raise ValueError("Variant metadata dictionary offsets must start with zero")
-    if any(left > right for left, right in zip(offsets, offsets[1:])):
+    if any(left > right for left, right in zip(offsets, offsets[1:], strict=False)):
         raise ValueError("Variant metadata dictionary offsets must be ordered")
 
     dictionary_bytes = metadata_bytes[offset:]
     if offsets[-1] != len(dictionary_bytes):
         raise ValueError("Variant metadata dictionary length does not match offsets")
 
-    return [dictionary_bytes[start:end].decode("utf-8") for start, end in zip(offsets, offsets[1:])]
+    return [dictionary_bytes[start:end].decode("utf-8") for start, end in zip(offsets, offsets[1:], strict=False)]
 
 
 def _encode_value(value: Any, dictionary: dict[str, int]) -> bytes:
@@ -157,8 +181,16 @@ def _encode_value(value: Any, dictionary: dict[str, int]) -> bytes:
         return _encode_int(value)
     if isinstance(value, float):
         return _primitive_header(_PRIMITIVE_DOUBLE) + struct.pack("<d", value)
+    if isinstance(value, Decimal):
+        return _encode_decimal(value)
+    if isinstance(value, datetime):
+        return _encode_timestamp(value)
+    if isinstance(value, date):
+        return _primitive_header(_PRIMITIVE_DATE) + (value - _EPOCH_DATE).days.to_bytes(4, "little", signed=True)
     if isinstance(value, str):
         return _encode_string(value)
+    if isinstance(value, bytes):
+        return _encode_binary(value)
     if isinstance(value, dict):
         return _encode_object(value, dictionary)
     if isinstance(value, list):
@@ -191,6 +223,45 @@ def _encode_string(value: str) -> bytes:
     return _primitive_header(_PRIMITIVE_STRING) + _write_unsigned(len(value_bytes), 4) + value_bytes
 
 
+def _encode_binary(value: bytes) -> bytes:
+    if len(value) > _MAX_UINT32:
+        raise ValueError("Variant binary value is too long")
+    return _primitive_header(_PRIMITIVE_BINARY) + _write_unsigned(len(value), 4) + value
+
+
+def _encode_decimal(value: Decimal) -> bytes:
+    sign, digits, exponent = value.as_tuple()
+    if not isinstance(exponent, int):
+        raise ValueError(f"Variant decimal cannot encode non-finite value: {value}")
+    scale = -exponent
+    if scale < 0 or scale > _MAX_DECIMAL_SCALE:
+        raise ValueError(f"Variant decimal scale must be in [0, 38]: {scale}")
+    unscaled = int("".join(str(digit) for digit in digits) or "0")
+    if sign:
+        unscaled = -unscaled
+
+    if _MIN_INT32 <= unscaled <= _MAX_INT32:
+        primitive_type, width = _PRIMITIVE_DECIMAL4, 4
+    elif _MIN_INT64 <= unscaled <= _MAX_INT64:
+        primitive_type, width = _PRIMITIVE_DECIMAL8, 8
+    elif _MIN_INT128 <= unscaled <= _MAX_INT128:
+        primitive_type, width = _PRIMITIVE_DECIMAL16, 16
+    else:
+        raise ValueError(f"Variant decimal unscaled value out of int128 range: {unscaled}")
+
+    return _primitive_header(primitive_type) + bytes([scale]) + unscaled.to_bytes(width, "little", signed=True)
+
+
+def _encode_timestamp(value: datetime) -> bytes:
+    if value.tzinfo is not None:
+        micros = round((value - _EPOCH_DATETIME_UTC).total_seconds() * 1_000_000)
+        primitive_type = _PRIMITIVE_TIMESTAMP_TZ
+    else:
+        micros = round((value - _EPOCH_DATETIME_UTC.replace(tzinfo=None)).total_seconds() * 1_000_000)
+        primitive_type = _PRIMITIVE_TIMESTAMP_NTZ
+    return _primitive_header(primitive_type) + micros.to_bytes(8, "little", signed=True)
+
+
 def _encode_object(value: dict[Any, Any], dictionary: dict[str, int]) -> bytes:
     items = []
     for key, child in value.items():
@@ -207,12 +278,7 @@ def _encode_object(value: dict[Any, Any], dictionary: dict[str, int]) -> bytes:
     field_offset_size = _unsigned_width(len(value_region))
     field_id_size = _unsigned_width(max(field_ids, default=0))
     is_large = len(items) > 255
-    header = (
-        _BASIC_TYPE_OBJECT
-        | ((field_offset_size - 1) << 2)
-        | ((field_id_size - 1) << 4)
-        | (0x40 if is_large else 0)
-    )
+    header = _BASIC_TYPE_OBJECT | ((field_offset_size - 1) << 2) | ((field_id_size - 1) << 4) | (0x40 if is_large else 0)
 
     return b"".join(
         [
@@ -292,10 +358,44 @@ def _decode_primitive(primitive_type: int, value_bytes: bytes, offset: int) -> t
     if primitive_type == _PRIMITIVE_DOUBLE:
         _require_available(value_bytes, offset, 8)
         return struct.unpack_from("<d", value_bytes, offset)[0], offset + 8
+    if primitive_type == _PRIMITIVE_FLOAT:
+        _require_available(value_bytes, offset, 4)
+        return struct.unpack_from("<f", value_bytes, offset)[0], offset + 4
+    if primitive_type == _PRIMITIVE_DECIMAL4:
+        return _read_decimal(value_bytes, offset, 4)
+    if primitive_type == _PRIMITIVE_DECIMAL8:
+        return _read_decimal(value_bytes, offset, 8)
+    if primitive_type == _PRIMITIVE_DECIMAL16:
+        return _read_decimal(value_bytes, offset, 16)
+    if primitive_type == _PRIMITIVE_DATE:
+        days, offset = _read_signed(value_bytes, offset, 4)
+        return _EPOCH_DATE + timedelta(days=days), offset
+    if primitive_type == _PRIMITIVE_TIMESTAMP_TZ:
+        micros, offset = _read_signed(value_bytes, offset, 8)
+        return _EPOCH_DATETIME_UTC + timedelta(microseconds=micros), offset
+    if primitive_type == _PRIMITIVE_TIMESTAMP_NTZ:
+        micros, offset = _read_signed(value_bytes, offset, 8)
+        return _EPOCH_DATETIME_UTC.replace(tzinfo=None) + timedelta(microseconds=micros), offset
+    if primitive_type == _PRIMITIVE_BINARY:
+        length, offset = _read_unsigned(value_bytes, offset, 4)
+        _require_available(value_bytes, offset, length)
+        return value_bytes[offset : offset + length], offset + length
     if primitive_type == _PRIMITIVE_STRING:
         length, offset = _read_unsigned(value_bytes, offset, 4)
         return _read_utf8(value_bytes, offset, length)
     raise ValueError(f"Unsupported variant primitive type: {primitive_type}")
+
+
+def _read_decimal(value_bytes: bytes, offset: int, width: int) -> tuple[Decimal, int]:
+    _require_available(value_bytes, offset, 1)
+    scale = value_bytes[offset]
+    offset += 1
+    if scale > _MAX_DECIMAL_SCALE:
+        raise ValueError(f"Variant decimal scale must be in [0, 38]: {scale}")
+    unscaled, offset = _read_signed(value_bytes, offset, width)
+    sign = 1 if unscaled < 0 else 0
+    digits = tuple(int(digit) for digit in str(abs(unscaled)))
+    return Decimal((sign, digits, -scale)), offset
 
 
 def _decode_object(metadata: int, value_bytes: bytes, offset: int, dictionary: list[str]) -> tuple[dict[str, Any], int]:
@@ -366,7 +466,7 @@ def _read_offsets(value_bytes: bytes, offset: int, offset_size: int, num_element
 
     if not offsets or offsets[0] != 0:
         raise ValueError("Variant offsets must start with zero")
-    if any(left > right for left, right in zip(offsets, offsets[1:])):
+    if any(left > right for left, right in zip(offsets, offsets[1:], strict=False)):
         raise ValueError("Variant offsets must be ordered")
     return offsets, offset
 
