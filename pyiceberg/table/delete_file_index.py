@@ -193,8 +193,8 @@ class DeleteFileIndex:
                 deletes = self._by_partition.setdefault(key, PositionDeletes())
                 deletes.add(delete_file, seq)
         elif delete_file.content == DataFileContent.EQUALITY_DELETES:
-            key = _partition_key(delete_file.spec_id or 0, partition_key) if partition_key else None
-            deletes = self._eq_deletes.setdefault(key, EqualityDeletes())
+            eq_key: tuple[int, Record] | None = _partition_key(delete_file.spec_id or 0, partition_key) if partition_key else None
+            deletes = self._eq_deletes.setdefault(eq_key, EqualityDeletes())
             deletes.add(delete_file, seq)
 
     def for_data_file(self, seq_num: int, data_file: DataFile, partition_key: Record | None = None) -> set[DataFile]:
