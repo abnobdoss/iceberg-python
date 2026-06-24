@@ -987,8 +987,10 @@ def test_positional_delete_schema_pos_is_long() -> None:
 
     assert file_path_field.name == "file_path"
     assert isinstance(file_path_field.field_type, StringType)
+    assert file_path_field.required is True
     assert pos_field.name == "pos"
     assert isinstance(pos_field.field_type, LongType)
+    assert pos_field.required is True
 
 
 def test_positional_delete_schema_pos_serializes_as_avro_long() -> None:

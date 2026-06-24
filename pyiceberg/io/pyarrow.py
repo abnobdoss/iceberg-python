@@ -123,6 +123,7 @@ from pyiceberg.io import (
 )
 from pyiceberg.io.fileformat import DataFileStatistics as DataFileStatistics
 from pyiceberg.manifest import (
+    POSITIONAL_DELETE_SCHEMA,
     DataFile,
     DataFileContent,
     FileFormat,
@@ -207,11 +208,6 @@ DOC = "doc"
 UTC_ALIASES = {"UTC", "+00:00", "Etc/UTC", "Z"}
 
 T = TypeVar("T")
-
-POSITIONAL_DELETE_WRITE_SCHEMA = Schema(
-    NestedField(2147483546, "file_path", StringType()),
-    NestedField(2147483545, "pos", LongType()),
-)
 
 
 @lru_cache
@@ -2707,12 +2703,22 @@ def write_position_delete_file(
     spec_id copied from the referenced data file so it is partition-scoped, and record_count
     equal to the number of deleted positions.
     """
+    if referenced_data_file.content != DataFileContent.DATA:
+        raise ValueError(f"referenced_data_file must be a DATA file, got {referenced_data_file.content}")
+
+    try:
+        spec_id = referenced_data_file.spec_id
+    except AttributeError:
+        spec_id = table_metadata.default_spec_id
+
     write_uuid = write_uuid or uuid.uuid4()
     counter = counter or itertools.count(0)
 
     delete_positions = sorted({int(position) for position in positions})
     if not delete_positions:
         raise ValueError("Cannot write an empty position-delete file")
+    if delete_positions[0] < 0:
+        raise ValueError("Position-delete positions must be non-negative")
 
     parquet_writer_kwargs = _get_parquet_writer_kwargs(table_metadata.properties)
     row_group_size = property_as_int(
@@ -2743,7 +2749,7 @@ def write_position_delete_file(
         with pq.ParquetWriter(fos, schema=arrow_table.schema, store_decimal_as_integer=True, **parquet_writer_kwargs) as writer:
             writer.write(arrow_table, row_group_size=row_group_size)
 
-    stats_columns = compute_statistics_plan(POSITIONAL_DELETE_WRITE_SCHEMA, table_metadata.properties)
+    stats_columns = compute_statistics_plan(POSITIONAL_DELETE_SCHEMA, table_metadata.properties)
     stats_columns[2147483546] = StatisticsCollector(
         field_id=2147483546,
         iceberg_type=StringType(),
@@ -2753,7 +2759,7 @@ def write_position_delete_file(
     statistics = data_file_statistics_from_parquet_metadata(
         parquet_metadata=writer.writer.metadata,
         stats_columns=stats_columns,
-        parquet_column_mapping=parquet_path_to_id_mapping(POSITIONAL_DELETE_WRITE_SCHEMA),
+        parquet_column_mapping=parquet_path_to_id_mapping(POSITIONAL_DELETE_SCHEMA),
     )
 
     data_file = DataFile.from_args(
@@ -2764,12 +2770,12 @@ def write_position_delete_file(
         partition=referenced_data_file.partition,
         file_size_in_bytes=len(fo),
         sort_order_id=None,
-        spec_id=referenced_data_file.spec_id,
+        spec_id=spec_id,
         equality_ids=None,
         key_metadata=None,
         **statistics.to_serialized_dict(),
     )
-    data_file.spec_id = referenced_data_file.spec_id
+    data_file.spec_id = spec_id
     return data_file
 
 
