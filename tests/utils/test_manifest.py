@@ -991,6 +991,17 @@ def test_positional_delete_schema_pos_is_long() -> None:
     assert isinstance(pos_field.field_type, LongType)
 
 
+def test_positional_delete_schema_pos_serializes_as_avro_long() -> None:
+    from pyiceberg.manifest import POSITIONAL_DELETE_SCHEMA
+    from pyiceberg.utils.schema_conversion import AvroSchemaConversion
+
+    avro_schema = AvroSchemaConversion().iceberg_to_avro(POSITIONAL_DELETE_SCHEMA, schema_name="pos_delete")
+    pos_field = next(field for field in avro_schema["fields"] if field["name"] == "pos")
+
+    assert "long" in pos_field["type"]
+    assert "int" not in pos_field["type"]
+
+
 def test_positional_delete_pos_above_int32_round_trips() -> None:
     # A position beyond int32 range must survive conversion to/from the bound bytes
     # that get stored in a position-delete DataFile's lower/upper bounds.
@@ -1006,12 +1017,12 @@ def test_positional_delete_pos_above_int32_round_trips() -> None:
     assert from_bytes(pos_type, encoded) == large_pos
 
 
-def test_positional_delete_datafile_large_pos_round_trips_through_manifest(
+def test_position_delete_datafile_large_pos_bounds_round_trip_through_manifest(
     test_schema: Schema,
     test_partition_spec: PartitionSpec,
 ) -> None:
-    # End-to-end: a POSITION_DELETES DataFile whose pos bounds exceed int32 must
-    # round-trip through a written/read v2 manifest without overflow.
+    # A DataFile carrying POSITION_DELETES content with pos bounds beyond int32
+    # round-trips through a written/read v2 manifest's map<int, bytes> bounds.
     from pyiceberg.conversions import from_bytes, to_bytes
     from pyiceberg.manifest import POSITIONAL_DELETE_SCHEMA
     from pyiceberg.types import LongType, StringType
