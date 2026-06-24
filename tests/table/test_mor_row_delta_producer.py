@@ -251,6 +251,7 @@ def test_row_delta_position_delete_end_to_end(catalog: Catalog) -> None:
 
     current_snapshot = table.current_snapshot()
     assert current_snapshot is not None
+    assert current_snapshot.summary is not None
     assert current_snapshot.summary.operation == Operation.OVERWRITE
 
     reloaded = catalog.load_table(identifier)
@@ -293,6 +294,7 @@ def test_position_delete_sequence_number_does_not_affect_later_appends(catalog: 
     first_snapshot = table.current_snapshot()
     assert first_snapshot is not None
     first_sequence_number = first_snapshot.sequence_number
+    assert first_sequence_number is not None
 
     delete_file = write_position_delete_file(
         table.io,
