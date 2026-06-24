@@ -515,6 +515,24 @@ def test_older_than_matching_nothing_with_retain_last_expires_nothing(table_v2: 
     assert remaining_ids == {101, 102, 103, 104, 105}
 
 
+def test_empty_by_ids_with_retain_last_expires_nothing(table_v2: Table) -> None:
+    _prepare_table_with_snapshots(
+        table_v2,
+        [
+            (101, 1000),
+            (102, 2000),
+            (103, 3000),
+        ],
+    )
+    _configure_commit_to_apply_updates(table_v2)
+
+    # An explicit (if empty) by_ids selector means retain_last acts only as a floor, not standalone.
+    table_v2.maintenance.expire_snapshots().by_ids([]).retain_last(1).commit()
+
+    remaining_ids = {snapshot.snapshot_id for snapshot in table_v2.metadata.snapshots}
+    assert remaining_ids == {101, 102, 103}
+
+
 def test_retain_last_tiebreak_uses_sequence_number(table_v2: Table) -> None:
     _prepare_table_with_snapshots(
         table_v2,

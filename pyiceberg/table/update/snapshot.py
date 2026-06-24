@@ -1144,6 +1144,7 @@ class ExpireSnapshots(UpdateTableMetadata["ExpireSnapshots"]):
         Returns:
             This for method chaining.
         """
+        self._has_other_selectors = True
         for snapshot_id in snapshot_ids:
             self.by_id(snapshot_id)
         return self
