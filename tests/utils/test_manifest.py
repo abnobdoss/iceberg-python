@@ -16,6 +16,7 @@
 # under the License.
 # pylint: disable=redefined-outer-name,arguments-renamed,fixme
 from tempfile import TemporaryDirectory
+from typing import Any, cast
 
 import fastavro
 import pytest
@@ -997,7 +998,7 @@ def test_positional_delete_schema_pos_serializes_as_avro_long() -> None:
     from pyiceberg.manifest import POSITIONAL_DELETE_SCHEMA
     from pyiceberg.utils.schema_conversion import AvroSchemaConversion
 
-    avro_schema = AvroSchemaConversion().iceberg_to_avro(POSITIONAL_DELETE_SCHEMA, schema_name="pos_delete")
+    avro_schema = cast(dict[str, Any], AvroSchemaConversion().iceberg_to_avro(POSITIONAL_DELETE_SCHEMA, schema_name="pos_delete"))
     pos_field = next(field for field in avro_schema["fields"] if field["name"] == "pos")
 
     assert "long" in pos_field["type"]
