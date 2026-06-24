@@ -227,6 +227,17 @@ def test_mor_delete_sequence_number_scopes_delete_to_existing_data_files(catalog
     delete_snapshot = table.current_snapshot()
     assert delete_snapshot is not None
 
+    # The position-delete file's sequence number must equal the delete snapshot's sequence
+    # number. This is what scopes the delete to pre-existing data files only: a positional
+    # delete applies to data with a data-sequence-number <= the delete's sequence number.
+    delete_entry_sequence_numbers = [
+        entry.sequence_number
+        for manifest in delete_snapshot.manifests(io=table.io)
+        if manifest.content == ManifestContent.DELETES
+        for entry in manifest.fetch_manifest_entry(io=table.io)
+    ]
+    assert delete_entry_sequence_numbers == [delete_snapshot.sequence_number]
+
     _append_rows(table, [{"id": 2, "data": "new-b"}, {"id": 4, "data": "new-d"}])
 
     assert _rows(table) == [
@@ -240,6 +251,8 @@ def test_mor_delete_sequence_number_scopes_delete_to_existing_data_files(catalog
     append_snapshot = table.current_snapshot()
     assert append_snapshot is not None
     assert append_snapshot.sequence_number == delete_snapshot.sequence_number + 1
+    # The newly appended data has a strictly higher data sequence number than the delete
+    # file, so the re-inserted id=2 survives even though it shares the deleted value.
 
 
 def test_successive_mor_deletes_do_not_reemit_already_deleted_positions(catalog: Catalog) -> None:
@@ -320,6 +333,42 @@ def test_mor_delete_no_match_warns_and_does_not_create_snapshot(catalog: Catalog
     assert _current_delete_files(table) == []
 
 
+def test_mor_delete_with_user_column_named_like_internal_position(catalog: Catalog) -> None:
+    # The MoR delete path appends a temporary position column to compute matching rows.
+    # If a real table column shares that internal name, the path must not collide or
+    # mistakenly read the user column as positions.
+    schema = Schema(
+        NestedField(1, "id", LongType(), required=True),
+        NestedField(2, "__pyiceberg_position", LongType(), required=True),
+    )
+    arrow_schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("__pyiceberg_position", pa.int64(), nullable=False),
+        ]
+    )
+    table = _create_table(catalog, "default.test_mor_delete_position_name_collision", schema=schema)
+    _append_rows(
+        table,
+        [
+            {"id": 1, "__pyiceberg_position": 100},
+            {"id": 2, "__pyiceberg_position": 200},
+            {"id": 3, "__pyiceberg_position": 300},
+        ],
+        schema=arrow_schema,
+    )
+    before_data_paths = _data_paths(table)
+
+    table.delete(EqualTo("id", 2))
+
+    assert sorted(table.scan().to_arrow().to_pylist(), key=lambda row: row["id"]) == [
+        {"id": 1, "__pyiceberg_position": 100},
+        {"id": 3, "__pyiceberg_position": 300},
+    ]
+    assert _data_paths(table) == before_data_paths
+    assert len(_current_delete_files(table)) == 1
+
+
 def test_mor_delete_position_alignment_across_multiple_record_batches(catalog: Catalog) -> None:
     # A position-delete `pos` is a GLOBAL 0-based physical row index into the data file.
     # When a single data file is read in multiple record batches, the running position
@@ -347,6 +396,11 @@ def test_mor_delete_position_alignment_across_multiple_record_batches(catalog: C
     data_files = _current_data_files(table)
     assert len(data_files) == 1  # single physical file; positions are global within it
     before_paths = _data_paths(table)
+
+    # Guard the test's own premise: the single file must actually be read in multiple
+    # batches, otherwise a batch-local position regression would never be exercised.
+    batch_count = sum(1 for _ in table.scan().to_arrow_batch_reader())
+    assert batch_count > 1, "expected the data file to be read in multiple record batches"
 
     # id=137 sits far past the first batch; its physical position equals 137.
     table.delete(EqualTo("id", 137))
