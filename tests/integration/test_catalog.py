@@ -66,6 +66,7 @@ def memory_catalog(tmp_path: PosixPath) -> Generator[Catalog, None, None]:
     yield test_catalog
 
     clean_up(test_catalog)
+    test_catalog.close()
 
 
 @pytest.fixture(scope="function")

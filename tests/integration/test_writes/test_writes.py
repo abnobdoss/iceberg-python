@@ -2386,6 +2386,8 @@ def test_nanosecond_support_on_catalog(
             session_catalog, identifier, {"format-version": "2"}, schema=arrow_table_schema_with_all_timestamp_precisions
         )
 
+    catalog.close()
+
 
 @pytest.mark.integration
 @pytest.mark.parametrize("format_version", [1, 2])
