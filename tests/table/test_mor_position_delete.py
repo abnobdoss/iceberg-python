@@ -23,7 +23,7 @@ import pytest
 
 from pyiceberg.catalog import Catalog
 from pyiceberg.expressions import AlwaysTrue, EqualTo, In
-from pyiceberg.manifest import DataFile, DataFileContent, ManifestContent
+from pyiceberg.manifest import DataFile, DataFileContent, ManifestContent, ManifestFile
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.table import Table, TableProperties
@@ -104,7 +104,7 @@ def _position_delete_files(table: Table) -> list[DataFile]:
     return _content_files(table, DataFileContent.POSITION_DELETES)
 
 
-def _delete_manifests(table: Table):
+def _delete_manifests(table: Table) -> list[ManifestFile]:
     snapshot = table.current_snapshot()
     assert snapshot is not None
     return [manifest for manifest in snapshot.manifests(table.io) if manifest.content == ManifestContent.DELETES]
@@ -121,6 +121,7 @@ def test_single_row_mor_delete(catalog: Catalog) -> None:
     assert _data_file_paths(table) == data_paths_before
     snapshot = table.current_snapshot()
     assert snapshot is not None
+    assert snapshot.summary is not None
     assert snapshot.summary.operation == Operation.OVERWRITE
 
     delete_files = _position_delete_files(table)
