@@ -893,7 +893,7 @@ class ManifestFile(Record):
         return self._data[15] if len(self._data) > 15 else None
 
     @first_row_id.setter
-    def first_row_id(self, value: int) -> None:
+    def first_row_id(self, value: int | None) -> None:
         if len(self._data) <= 15:
             self._data.append(value)
         else:
