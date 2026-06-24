@@ -626,18 +626,6 @@ class _AppendDeletionVectors(_FastAppendFiles):
 
         return self._process_manifests(_write_dv_manifest() + self._existing_manifests())
 
-    def _summary(self, snapshot_properties: dict[str, str] = EMPTY_DICT) -> Summary:
-        ssc = SnapshotSummaryCollector(partition_summary_limit=0)
-        previous_snapshot = (
-            self._transaction.table_metadata.snapshot_by_id(self._parent_snapshot_id)
-            if self._parent_snapshot_id is not None
-            else None
-        )
-        return update_snapshot_summaries(
-            summary=Summary(operation=self._operation, **ssc.build(), **snapshot_properties),
-            previous_summary=previous_snapshot.summary if previous_snapshot is not None else None,
-        )
-
 
 class _MergeAppendFiles(_FastAppendFiles):
     _target_size_bytes: int

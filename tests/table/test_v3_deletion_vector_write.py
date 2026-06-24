@@ -120,6 +120,26 @@ def test_deletion_vector_manifest_entry_persisted_on_disk(catalog) -> None:  # t
     assert ids == [1, 2, 3, 4, 5, 6]
 
 
+def test_deletion_vector_snapshot_summary_accounts_for_deletes(catalog) -> None:  # type: ignore[no-untyped-def]
+    schema = pa.schema([("id", pa.int64())])
+    table = catalog.create_table("ns.dv_summary", schema=schema, properties={"format-version": "3"})
+    table.append(pa.table({"id": list(range(10))}))
+
+    _commit_dv(catalog, "ns.dv_summary", [2, 4, 6])
+
+    table = catalog.load_table("ns.dv_summary")
+    summary = table.current_snapshot().summary
+    assert summary.operation.value == "delete"
+    # The DELETE snapshot must record the committed deletion vector in both the
+    # per-snapshot (added-*) and table-level (total-*) accounting; otherwise engines
+    # and table.inspect undercount delete files forever.
+    assert summary["added-delete-files"] == "1"
+    assert summary["added-position-delete-files"] == "1"
+    assert summary["added-position-deletes"] == "3"
+    assert summary["total-delete-files"] == "1"
+    assert summary["total-position-deletes"] == "3"
+
+
 def test_deletion_vectors_require_v3(catalog) -> None:  # type: ignore[no-untyped-def]
     schema = pa.schema([("id", pa.int64())])
     table = catalog.create_table("ns.v2", schema=schema, properties={"format-version": "2"})
