@@ -30,7 +30,6 @@ from pyiceberg.serializers import (
     GzipCompressor,
     NoopCompressor,
     ToOutputFile,
-    ZstdCompressor,
     metadata_file_extension,
 )
 from pyiceberg.table import StaticTable, TableProperties
@@ -76,9 +75,8 @@ def test_null_serializer_field() -> None:
     ("location", "compressor_type"),
     [
         ("s3://bucket/table/metadata/00000-table.gz.metadata.json", GzipCompressor),
-        ("s3://bucket/table/metadata/00000-table.metadata.json.gz", GzipCompressor),
-        ("s3://bucket/table/metadata/00000-table.zst.metadata.json", ZstdCompressor),
         ("s3://bucket/table/metadata/00000-table.metadata.json", NoopCompressor),
+        ("s3://bucket/table/metadata/00000-table.lz4.metadata.json", NoopCompressor),
     ],
 )
 def test_get_compressor_detects_metadata_compression(location: str, compressor_type: type[Compressor]) -> None:
@@ -92,20 +90,19 @@ def test_get_compressor_detects_metadata_compression(location: str, compressor_t
         ("none", NoopCompressor),
         ("gzip", GzipCompressor),
         ("GZIP", GzipCompressor),
-        ("zstd", ZstdCompressor),
     ],
 )
 def test_from_codec_name(codec_name: str | None, compressor_type: type[Compressor]) -> None:
     assert isinstance(Compressor.from_codec_name(codec_name), compressor_type)
 
 
-@pytest.mark.parametrize("codec_name", ["lz4", "snappy", "bogus"])
+@pytest.mark.parametrize("codec_name", ["zstd", "lz4", "snappy", "bogus"])
 def test_from_codec_name_raises_for_unknown_codec(codec_name: str) -> None:
     with pytest.raises(ValueError, match=f"Unsupported metadata compression codec: {codec_name}"):
         Compressor.from_codec_name(codec_name)
 
 
-@pytest.mark.parametrize("codec_name", ["none", "gzip", "zstd"])
+@pytest.mark.parametrize("codec_name", ["none", "gzip"])
 def test_table_metadata_round_trip_with_compression(
     tmp_path: Path, example_table_metadata_v2: dict[str, Any], codec_name: str
 ) -> None:
@@ -116,6 +113,14 @@ def test_table_metadata_round_trip_with_compression(
     metadata_location = str(tmp_path / f"{uuid.uuid4()}{metadata_file_extension(codec_name)}")
 
     ToOutputFile.table_metadata(metadata, file_io.new_output(location=metadata_location), overwrite=True)
+
+    raw_bytes = Path(metadata_location).read_bytes()
+    if codec_name == "gzip":
+        # Java writes gzip-compressed metadata when this codec is set; assert we match by
+        # checking the gzip magic bytes rather than relying on the (lossless) round trip.
+        assert raw_bytes[:2] == b"\x1f\x8b"
+    else:
+        assert raw_bytes.lstrip().startswith(b"{")
 
     parsed_metadata = FromInputFile.table_metadata(file_io.new_input(location=metadata_location))
     assert parsed_metadata == metadata
@@ -129,7 +134,6 @@ def test_table_metadata_round_trip_with_compression(
         ({}, ".metadata.json"),
         ({TableProperties.WRITE_METADATA_COMPRESSION: "none"}, ".metadata.json"),
         ({TableProperties.WRITE_METADATA_COMPRESSION: "gzip"}, ".gz.metadata.json"),
-        ({TableProperties.WRITE_METADATA_COMPRESSION: "zstd"}, ".zst.metadata.json"),
     ],
 )
 def test_new_table_metadata_file_location_uses_metadata_compression(

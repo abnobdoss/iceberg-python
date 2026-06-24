@@ -102,11 +102,8 @@ TABLE_METADATA_FILE_NAME_REGEX = re.compile(
     (\d+)              # version number
     -                  # separator
     ([\w-]{36})        # UUID (36 characters, including hyphens)
-    (?:
-        (?:\.\w+)?     # optional codec name
-        \.metadata\.json
-        | \.metadata\.json\.gz
-    )                  # file extension
+    (?:\.\w+)?         # optional codec name
+    \.metadata\.json   # file extension
     """,
     re.X,
 )
