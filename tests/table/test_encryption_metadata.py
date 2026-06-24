@@ -90,6 +90,19 @@ def test_encrypted_key_serialization_round_trip_uses_aliases() -> None:
     assert "encrypted_key_metadata" not in serialized
 
 
+def test_encrypted_key_ignores_unknown_fields() -> None:
+    encrypted_key = EncryptedKey.model_validate(
+        {
+            "key-id": "key-a",
+            "encrypted-key-metadata": "ZW5jcnlwdGVkLW1ldGFkYXRh",
+            "some-future-field": "ignored",
+        }
+    )
+
+    assert encrypted_key.key_id == "key-a"
+    assert not hasattr(encrypted_key, "some_future_field")
+
+
 def test_snapshot_key_id_deserialization_and_serialization() -> None:
     snapshot = Snapshot.model_validate(
         {
