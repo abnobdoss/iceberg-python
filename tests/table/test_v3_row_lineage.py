@@ -309,17 +309,24 @@ def test_v3_overwrite_delete_in_shared_manifest_preserves_survivor_row_ids(v3_ca
     assert sorted(row["id"] for row in tbl.scan().to_arrow().to_pylist()) == [100, 101, 102]
 
 
-def test_v3_overwrite_delete_fails_when_survivor_row_id_cannot_be_preserved(v3_catalog: Catalog) -> None:
-    v3_catalog.create_namespace("ns")
-    tbl = v3_catalog.create_table("ns.t", schema=SCHEMA, properties={"format-version": "3"})
+def test_v3_overwrite_delete_fails_when_survivor_row_id_cannot_be_preserved(tmp_path: Path) -> None:
+    """When a survivor cannot have its row id preserved, the v3 overwrite must fail loudly.
 
+    Genuine un-preservable case: two data files share ONE manifest written while the table was
+    still v2 (manifest first_row_id is null and the data files have no field-142). After
+    upgrading to v3, deleting one file via the overwrite path would rewrite the manifest with
+    the survivor whose absolute row id is unknown, so the writer must NOT silently renumber it.
+    """
+    cat = InMemoryCatalog("t1undp", warehouse=f"file://{tmp_path}")
+    cat.create_namespace("ns")
+    tbl = cat.create_table("ns.t", schema=SCHEMA, properties={"format-version": "2"})
     _append_data_files_in_one_manifest(tbl, [[0, 1, 2], [100, 101, 102]])
-    tbl = v3_catalog.load_table("ns.t")
+    tbl = cat.load_table("ns.t")
+
+    with tbl.transaction() as txn:
+        txn.upgrade_table_version(3)
+    tbl = cat.load_table("ns.t")
     first_file = _data_files(tbl)[0]
-    snap = tbl.metadata.current_snapshot()
-    assert snap is not None
-    data_manifest = next(m for m in snap.manifests(tbl.io) if m.content == ManifestContent.DATA)
-    data_manifest.first_row_id = None  # type: ignore[assignment]
 
     with pytest.raises(NotImplementedError, match="row lineage"):
         with tbl.transaction() as txn:
@@ -560,6 +567,59 @@ def test_v3_upgrade_from_v2_seeds_next_row_id(tmp_path: Path) -> None:
     assert snap.first_row_id == 0
     assert snap.added_rows == 3
     assert tbl.metadata.next_row_id == 3
+
+
+def test_v3_upgrade_with_data_does_not_renumber_carried_v2_files(tmp_path: Path) -> None:
+    """Upgrading a NON-empty v2 table to v3 must assign each carried-forward file a row id
+    range exactly once and keep it stable across later commits.
+
+    Regression: the module-level manifest cache is keyed only by manifest_path and previously
+    returned the pre-upgrade v2 ManifestFile (first_row_id=None). The v3 manifest-list writer
+    then re-assigned a fresh first_row_id to those carried files on EVERY subsequent commit,
+    double-counting next_row_id (9 -> 15 instead of 10) and renumbering already-assigned rows.
+    """
+    cat = InMemoryCatalog("t1upd", warehouse=f"file://{tmp_path}")
+    cat.create_namespace("ns")
+    tbl = cat.create_table("ns.t", schema=SCHEMA, properties={"format-version": "2"})
+    # 5 v2 rows across two data manifests, written BEFORE the upgrade.
+    tbl.append(_batch([0, 1, 2]))
+    tbl = cat.load_table("ns.t")
+    tbl.append(_batch([10, 11]))
+    tbl = cat.load_table("ns.t")
+
+    with tbl.transaction() as txn:
+        txn.upgrade_table_version(3)
+    tbl = cat.load_table("ns.t")
+    assert tbl.metadata.next_row_id == 0
+
+    # First v3 append: 4 new rows. The 5 carried v2 rows get assigned ids for the first time.
+    tbl.append(_batch([100, 101, 102, 103]))
+    tbl = cat.load_table("ns.t")
+    snap1 = tbl.metadata.current_snapshot()
+    assert snap1 is not None
+    after_first = tbl.metadata.next_row_id
+    assert after_first == 9, "5 carried rows + 4 new rows must yield next_row_id == 9"
+    frid_by_path_1 = {
+        m.manifest_path: m.first_row_id for m in snap1.manifests(tbl.io) if m.content == ManifestContent.DATA
+    }
+    assert all(frid is not None for frid in frid_by_path_1.values()), "carried files must be assigned a first_row_id"
+
+    # Second v3 append: only 1 NEW row. next_row_id must advance by exactly 1, NOT re-count carried rows.
+    tbl.append(_batch([200]))
+    tbl = cat.load_table("ns.t")
+    snap2 = tbl.metadata.current_snapshot()
+    assert snap2 is not None
+    assert tbl.metadata.next_row_id == 10, "second append must advance next_row_id by exactly 1 new row"
+    assert snap2.added_rows == 1
+
+    # Immutability: every manifest present in both snapshots must keep the SAME first_row_id.
+    frid_by_path_2 = {
+        m.manifest_path: m.first_row_id for m in snap2.manifests(tbl.io) if m.content == ManifestContent.DATA
+    }
+    for path in set(frid_by_path_1) & set(frid_by_path_2):
+        assert frid_by_path_1[path] == frid_by_path_2[path], "carried-forward file was renumbered across snapshots"
+
+    assert sorted(row["id"] for row in tbl.scan().to_arrow().to_pylist()) == [0, 1, 2, 10, 11, 100, 101, 102, 103, 200]
 
 
 def test_v3_add_snapshot_update_advances_next_row_id_from_snapshot_first_row_id(v3_catalog: Catalog) -> None:

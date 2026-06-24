@@ -995,8 +995,21 @@ def _manifests(io: FileIO, manifest_list: str) -> tuple[ManifestFile, ...]:
     with _manifest_cache_lock:
         for manifest_file in manifest_files:
             manifest_path = manifest_file.manifest_path
-            if manifest_path in _manifest_cache:
-                result.append(_manifest_cache[manifest_path])
+            cached = _manifest_cache.get(manifest_path)
+            if cached is not None:
+                # first_row_id is assigned by the manifest-list writer and is therefore
+                # specific to the manifest list that references this manifest, not an
+                # intrinsic property of the manifest file. The same physical manifest can be
+                # referenced with first_row_id=None by an older (e.g. pre-v3-upgrade) list and
+                # with a concrete value by a v3 list, so the freshly read value must win;
+                # reusing the cached one would re-number carried-forward rows. Return a copy
+                # carrying this list's first_row_id rather than mutating the shared cached object.
+                if cached.first_row_id != manifest_file.first_row_id:
+                    refreshed = copy(cached)
+                    refreshed.first_row_id = manifest_file.first_row_id
+                    result.append(refreshed)
+                else:
+                    result.append(cached)
             else:
                 _manifest_cache[manifest_path] = manifest_file
                 result.append(manifest_file)
