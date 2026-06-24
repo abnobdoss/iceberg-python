@@ -1873,11 +1873,13 @@ def _scan_with_equality_delete(
     equality_ids: list[int],
     delete_rows: list[dict[str, Any]],
     delete_key_fields: list[tuple[str, pa.DataType, int]],
+    data_schema: Schema | None = None,
 ) -> pa.Table:
-    data_schema = schema_to_pyarrow(schema, metadata={ICEBERG_SCHEMA: bytes(schema.model_dump_json(), UTF8)})
-    data_table = pa.Table.from_pylist(data_rows, schema=data_schema)
+    write_schema = data_schema or schema
+    data_arrow_schema = schema_to_pyarrow(write_schema, metadata={ICEBERG_SCHEMA: bytes(write_schema.model_dump_json(), UTF8)})
+    data_table = pa.Table.from_pylist(data_rows, schema=data_arrow_schema)
     data_file_path = str(tmp_path / "data.parquet")
-    _write_table_to_file(data_file_path, data_schema, data_table)
+    _write_table_to_file(data_file_path, data_arrow_schema, data_table)
 
     data_file = DataFile.from_args(
         content=DataFileContent.DATA,
@@ -1977,6 +1979,125 @@ def test_equality_delete_no_match(tmp_path: Path) -> None:
     )
 
     assert result.column("id").to_pylist() == [1, 3, 4]
+
+
+def test_equality_delete_missing_equality_ids_raises() -> None:
+    schema = Schema(NestedField(1, "id", IntegerType(), required=True))
+    arrow_schema = schema_to_pyarrow(schema)
+    batch = pa.RecordBatch.from_arrays([pa.array([1, 2, 3], type=pa.int32())], schema=arrow_schema)
+    delete_table = pa.Table.from_arrays([pa.array([2], type=pa.int32())], names=["id"])
+
+    with pytest.raises(ValueError, match="equality_ids"):
+        _apply_equality_deletes(
+            batch,
+            schema,
+            schema,
+            [([], delete_table)],
+            downcast_ns_timestamp_to_us=False,
+            format_version=TableProperties.DEFAULT_FORMAT_VERSION,
+        )
+
+
+def test_equality_delete_missing_column_in_data_file_is_all_null(tmp_path: Path) -> None:
+    schema = Schema(
+        NestedField(1, "id", IntegerType(), required=True),
+        NestedField(2, "category", StringType(), required=False),
+    )
+    data_schema = Schema(NestedField(1, "id", IntegerType(), required=True))
+
+    result = _scan_with_equality_delete(
+        tmp_path=tmp_path,
+        schema=schema,
+        data_schema=data_schema,
+        data_rows=[{"id": 1}, {"id": 2}, {"id": 3}],
+        equality_ids=[2],
+        delete_rows=[{"category": "delete"}],
+        delete_key_fields=[("category", pa.string(), 2)],
+    )
+
+    assert result.to_pydict() == {"id": [1, 2, 3], "category": [None, None, None]}
+
+
+def test_equality_delete_overflowing_promoted_delete_key_does_not_match(tmp_path: Path) -> None:
+    schema = Schema(NestedField(1, "id", IntegerType(), required=True))
+
+    result = _scan_with_equality_delete(
+        tmp_path=tmp_path,
+        schema=schema,
+        data_rows=[{"id": 1}, {"id": 2}, {"id": 3}],
+        equality_ids=[1],
+        delete_rows=[{"id": 2**40}],
+        delete_key_fields=[("id", pa.int64(), 1)],
+    )
+
+    assert result.column("id").to_pylist() == [1, 2, 3]
+
+
+def test_equality_delete_with_positional_delete(tmp_path: Path) -> None:
+    import pyarrow.parquet as pq
+
+    schema = Schema(NestedField(1, "id", IntegerType(), required=True))
+    data_arrow_schema = schema_to_pyarrow(schema, metadata={ICEBERG_SCHEMA: bytes(schema.model_dump_json(), UTF8)})
+    data_table = pa.Table.from_pylist([{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}], schema=data_arrow_schema)
+    data_file_path = str(tmp_path / "data.parquet")
+    _write_table_to_file(data_file_path, data_arrow_schema, data_table)
+
+    data_file = DataFile.from_args(
+        content=DataFileContent.DATA,
+        file_path=data_file_path,
+        file_format=FileFormat.PARQUET,
+        partition={},
+        record_count=data_table.num_rows,
+        file_size_in_bytes=os.path.getsize(data_file_path),
+    )
+    data_file.spec_id = 0
+
+    # Positional delete removes row at index 0 (id=1).
+    pos_delete_path = str(tmp_path / "pos-delete.parquet")
+    pq.write_table(pa.table({"file_path": [data_file_path], "pos": [0]}), pos_delete_path)
+    pos_delete_file = DataFile.from_args(
+        content=DataFileContent.POSITION_DELETES,
+        file_path=pos_delete_path,
+        file_format=FileFormat.PARQUET,
+        partition={},
+        record_count=1,
+        file_size_in_bytes=os.path.getsize(pos_delete_path),
+    )
+    pos_delete_file.spec_id = 0
+
+    # Equality delete removes id=3 by value.
+    eq_delete_schema = pa.schema([pa.field("id", pa.int32(), metadata={PYARROW_PARQUET_FIELD_ID_KEY: bytes("1", UTF8)})])
+    eq_delete_table = pa.Table.from_pylist([{"id": 3}], schema=eq_delete_schema)
+    eq_delete_path = str(tmp_path / "eq-delete.parquet")
+    _write_table_to_file(eq_delete_path, eq_delete_schema, eq_delete_table)
+    eq_delete_file = DataFile.from_args(
+        content=DataFileContent.EQUALITY_DELETES,
+        file_path=eq_delete_path,
+        file_format=FileFormat.PARQUET,
+        partition={},
+        record_count=1,
+        file_size_in_bytes=os.path.getsize(eq_delete_path),
+        equality_ids=[1],
+    )
+    eq_delete_file.spec_id = 0
+
+    task = FileScanTask(data_file=data_file, delete_files={pos_delete_file, eq_delete_file})
+    result = ArrowScan(
+        table_metadata=TableMetadataV2(
+            location=f"file://{tmp_path}",
+            last_column_id=max(schema.field_ids),
+            format_version=2,
+            current_schema_id=schema.schema_id,
+            schemas=[schema],
+            partition_specs=[PartitionSpec()],
+        ),
+        io=load_file_io(),
+        projected_schema=schema,
+        row_filter=AlwaysTrue(),
+    ).to_table([task])
+
+    # id=1 removed positionally, id=3 removed by equality; 2 and 4 survive.
+    assert result.column("id").to_pylist() == [2, 4]
 
 
 def test_equality_delete_multi_batch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

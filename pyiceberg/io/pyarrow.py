@@ -1149,9 +1149,7 @@ def _read_deletes(io: FileIO, data_file: DataFile) -> dict[str, pa.ChunkedArray]
 def _read_equality_delete(io: FileIO, data_file: DataFile) -> pa.Table:
     if data_file.file_format in {FileFormat.PARQUET, FileFormat.ORC}:
         with io.new_input(data_file.file_path).open() as fi:
-            delete_fragment = _get_file_format(
-                data_file.file_format, pre_buffer=True, buffer_size=ONE_MEGABYTE
-            ).make_fragment(fi)
+            delete_fragment = _get_file_format(data_file.file_format, pre_buffer=True, buffer_size=ONE_MEGABYTE).make_fragment(fi)
             return ds.Scanner.from_fragment(fragment=delete_fragment).to_table().combine_chunks()
     else:
         raise ValueError(f"Equality delete file format not supported: {data_file.file_format}")
@@ -1186,7 +1184,14 @@ def _equality_delete_key_names(
     delete_schema = pyarrow_to_schema(
         delete_table.schema, downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us, format_version=format_version
     )
-    data_names = [data_schema.find_field(field_id).name for field_id in equality_ids]
+    data_names: list[str] = []
+    for field_id in equality_ids:
+        try:
+            data_name = data_schema.find_field(field_id).name
+        except ValueError:
+            data_name = table_schema.find_field(field_id).name
+        data_names.append(data_name)
+
     delete_names: list[str] = []
     for field_id, data_name in zip(equality_ids, data_names, strict=True):
         try:
@@ -1200,6 +1205,55 @@ def _equality_delete_key_names(
     return data_names, delete_names
 
 
+def _integer_type_bounds(arrow_type: pa.DataType) -> tuple[int, int]:
+    bit_width = arrow_type.bit_width
+    if pa.types.is_unsigned_integer(arrow_type):
+        return 0, (2**bit_width) - 1
+    return -(2 ** (bit_width - 1)), (2 ** (bit_width - 1)) - 1
+
+
+def _cast_equality_delete_key_column(column: pa.ChunkedArray, data_type: pa.DataType) -> pa.ChunkedArray:
+    if column.type == data_type:
+        return column
+
+    try:
+        return column.cast(data_type)
+    except pa.lib.ArrowInvalid:
+        if not (pa.types.is_integer(column.type) and pa.types.is_integer(data_type)):
+            raise
+
+        source_min, source_max = _integer_type_bounds(column.type)
+        target_min, target_max = _integer_type_bounds(data_type)
+        if target_min > source_max or target_max < source_min:
+            return pa.chunked_array([pa.nulls(len(chunk), type=data_type) for chunk in column.chunks])
+
+        in_range = pc.is_valid(column)
+        if target_min > source_min:
+            in_range = pc.and_(in_range, pc.greater_equal(column, pa.scalar(target_min, type=column.type)))
+        if target_max < source_max:
+            in_range = pc.and_(in_range, pc.less_equal(column, pa.scalar(target_max, type=column.type)))
+
+        column = pc.if_else(in_range, column, pa.scalar(None, type=column.type))
+        return column.cast(data_type)
+
+
+def _materialize_missing_equality_delete_columns(
+    data_table: pa.Table, equality_ids: list[int], data_names: list[str], data_schema: Schema, table_schema: Schema
+) -> pa.Table:
+    for field_id, data_name in zip(equality_ids, data_names, strict=True):
+        try:
+            data_schema.find_field(field_id)
+        except ValueError:
+            if data_name not in data_table.column_names:
+                table_field = table_schema.find_field(field_id)
+                arrow_type = schema_to_pyarrow(table_field.field_type)
+                data_table = data_table.append_column(
+                    pa.field(data_name, arrow_type), pa.nulls(data_table.num_rows, type=arrow_type)
+                )
+
+    return data_table
+
+
 def _equality_delete_key_table(
     delete_table: pa.Table, data_table: pa.Table, data_names: list[str], delete_names: list[str]
 ) -> pa.Table:
@@ -1207,8 +1261,7 @@ def _equality_delete_key_table(
     for data_name, delete_name in zip(data_names, delete_names, strict=True):
         column = delete_table.column(delete_name)
         data_type = data_table.schema.field(data_name).type
-        if column.type != data_type:
-            column = column.cast(data_type)
+        column = _cast_equality_delete_key_column(column, data_type)
         arrays.append(column)
 
     return pa.Table.from_arrays(arrays, names=data_names)
@@ -1256,7 +1309,9 @@ def _apply_equality_deletes(
 
     data_table = pa.Table.from_batches([batch])
     for equality_ids, delete_table in equality_deletes:
-        if not equality_ids or delete_table.num_rows == 0:
+        if not equality_ids:
+            raise ValueError("Equality delete file is missing required equality_ids")
+        if delete_table.num_rows == 0:
             continue
 
         data_names, delete_names = _equality_delete_key_names(
@@ -1266,6 +1321,9 @@ def _apply_equality_deletes(
             table_schema,
             downcast_ns_timestamp_to_us,
             format_version,
+        )
+        data_table = _materialize_missing_equality_delete_columns(
+            data_table, equality_ids, data_names, file_project_schema, table_schema
         )
         delete_key_table = _equality_delete_key_table(delete_table, data_table, data_names, delete_names)
         null_key_mask = _has_null_equality_key(delete_key_table, data_names)
