@@ -900,15 +900,11 @@ class _ManifestMergeManager(Generic[U]):
                         if explicit_first_row_id is not None:
                             row_id_cursor = explicit_first_row_id
                         carries_existing_rows = not (
-                            entry.status == ManifestEntryStatus.ADDED
-                            and entry.snapshot_id == self._snapshot_producer.snapshot_id
+                            entry.status == ManifestEntryStatus.ADDED and entry.snapshot_id == self._snapshot_producer.snapshot_id
                         )
-                        writes_existing_or_deleted = (
-                            carries_existing_rows
-                            and (
-                                entry.status != ManifestEntryStatus.DELETED
-                                or entry.snapshot_id == self._snapshot_producer.snapshot_id
-                            )
+                        writes_existing_or_deleted = carries_existing_rows and (
+                            entry.status != ManifestEntryStatus.DELETED
+                            or entry.snapshot_id == self._snapshot_producer.snapshot_id
                         )
                         if writes_existing_or_deleted and explicit_first_row_id is None:
                             if row_id_cursor is None:

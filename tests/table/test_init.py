@@ -1764,7 +1764,9 @@ def test_add_snapshot_update_fails_with_null_table_next_row_id(table_v3: Table) 
         ValueError,
         match="Cannot add a snapshot when table next-row-id is null",
     ):
-        update_table_metadata(table_v3.metadata.model_copy(update={"next_row_id": None}), (AddSnapshotUpdate(snapshot=new_snapshot),))
+        update_table_metadata(
+            table_v3.metadata.model_copy(update={"next_row_id": None}), (AddSnapshotUpdate(snapshot=new_snapshot),)
+        )
 
 
 def test_add_snapshot_update_updates_next_row_id(table_v3: Table) -> None:

@@ -900,6 +900,7 @@ class ManifestFile(Record):
             self._data[15] = value
 
     def __copy__(self) -> ManifestFile:
+        """Return a shallow copy that owns an independent data list."""
         cls = self.__class__
         new = cls.__new__(cls)
         new._data = list(self._data)
