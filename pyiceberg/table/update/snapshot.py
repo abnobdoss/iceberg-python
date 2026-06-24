@@ -429,7 +429,9 @@ class _DeleteFiles(_SnapshotProducer["_DeleteFiles"]):
             - Flag indicating that rewrites of data-files are needed.
         """
 
-        def _copy_with_new_status(entry: ManifestEntry, status: ManifestEntryStatus) -> ManifestEntry:
+        def _copy_with_new_status(
+            entry: ManifestEntry, status: ManifestEntryStatus, data_file: DataFile | None = None
+        ) -> ManifestEntry:
             return ManifestEntry.from_args(
                 status=status,
                 # When a file is replaced or deleted from the dataset, its manifest entry fields store the
@@ -437,7 +439,7 @@ class _DeleteFiles(_SnapshotProducer["_DeleteFiles"]):
                 snapshot_id=self.snapshot_id if status == ManifestEntryStatus.DELETED else entry.snapshot_id,
                 sequence_number=entry.sequence_number,
                 file_sequence_number=entry.file_sequence_number,
-                data_file=entry.data_file,
+                data_file=data_file if data_file is not None else entry.data_file,
             )
 
         # avoid copying metadata for each evaluator
@@ -500,7 +502,13 @@ class _DeleteFiles(_SnapshotProducer["_DeleteFiles"]):
                                         materialized_data_file.first_row_id = row_id_cursor
                                 if strict_metrics_evaluator(entry.data_file) == ROWS_MUST_MATCH:
                                     # Based on the metadata, it can be dropped right away
-                                    deleted_entries.append(_copy_with_new_status(entry, ManifestEntryStatus.DELETED))
+                                    deleted_entries.append(
+                                        _copy_with_new_status(
+                                            entry,
+                                            ManifestEntryStatus.DELETED,
+                                            materialized_data_file if is_v3 else entry.data_file,
+                                        )
+                                    )
                                     self._deleted_data_files.add(entry.data_file)
                                 else:
                                     # Based on the metadata, we cannot determine if it can be deleted
@@ -731,23 +739,51 @@ class _OverwriteFiles(_SnapshotProducer["_OverwriteFiles"]):
                 raise ValueError(f"Could not find the previous snapshot: {self._parent_snapshot_id}")
 
             executor = ExecutorFactory.get_or_create()
+            is_v3 = self._transaction.table_metadata.format_version >= 3
             manifest_evaluators: dict[int, Callable[[ManifestFile], bool]] = KeyDefaultDict(self._build_manifest_evaluator)
 
             def _get_entries(manifest: ManifestFile) -> list[ManifestEntry]:
                 if not manifest_evaluators[manifest.partition_spec_id](manifest):
                     return []
 
-                return [
-                    ManifestEntry.from_args(
-                        status=ManifestEntryStatus.DELETED,
-                        snapshot_id=self._snapshot_id,
-                        sequence_number=entry.sequence_number,
-                        file_sequence_number=entry.file_sequence_number,
-                        data_file=entry.data_file,
+                deleted_entries: list[ManifestEntry] = []
+                is_v3_data_manifest = is_v3 and manifest.content == ManifestContent.DATA
+                row_id_cursor: int | None = manifest.first_row_id if is_v3_data_manifest else None
+                for entry in manifest.fetch_manifest_entry(self._io, discard_deleted=True):
+                    materialized_data_file = entry.data_file
+                    is_deleted_data_file = (
+                        entry.data_file.content == DataFileContent.DATA and entry.data_file in self._deleted_data_files
                     )
-                    for entry in manifest.fetch_manifest_entry(self._io, discard_deleted=True)
-                    if entry.data_file.content == DataFileContent.DATA and entry.data_file in self._deleted_data_files
-                ]
+                    if is_v3_data_manifest:
+                        explicit_first_row_id = materialized_data_file.first_row_id
+                        if explicit_first_row_id is not None:
+                            row_id_cursor = explicit_first_row_id
+                        if is_deleted_data_file:
+                            if row_id_cursor is None:
+                                raise NotImplementedError(
+                                    "Cannot perform a v3 overwrite that preserves row lineage: the source "
+                                    "manifest is missing a first_row_id and the deleted data file "
+                                    f"{materialized_data_file.file_path} has no explicit field-142 "
+                                    "first_row_id."
+                                )
+                            if explicit_first_row_id is None:
+                                materialized_data_file = copy(materialized_data_file)
+                                materialized_data_file.first_row_id = row_id_cursor
+
+                    if is_deleted_data_file:
+                        deleted_entries.append(
+                            ManifestEntry.from_args(
+                                status=ManifestEntryStatus.DELETED,
+                                snapshot_id=self._snapshot_id,
+                                sequence_number=entry.sequence_number,
+                                file_sequence_number=entry.file_sequence_number,
+                                data_file=materialized_data_file,
+                            )
+                        )
+                    if is_v3_data_manifest and row_id_cursor is not None:
+                        row_id_cursor += materialized_data_file.record_count
+
+                return deleted_entries
 
             list_of_entries = executor.map(_get_entries, previous_snapshot.manifests(self._io))
             return list(itertools.chain(*list_of_entries))

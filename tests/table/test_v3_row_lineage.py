@@ -30,7 +30,7 @@ import pytest
 
 from pyiceberg.catalog import Catalog
 from pyiceberg.catalog.memory import InMemoryCatalog
-from pyiceberg.manifest import DataFile, ManifestContent
+from pyiceberg.manifest import DataFile, ManifestContent, ManifestEntryStatus
 from pyiceberg.schema import Schema
 from pyiceberg.table import Table
 from pyiceberg.table.metadata import TableMetadataUtil, TableMetadataV3
@@ -455,6 +455,33 @@ def test_v3_whole_file_delete_in_shared_manifest_preserves_survivor_row_ids(v3_c
     assert sorted(row["id"] for row in tbl.scan().to_arrow().to_pylist()) == [100, 101, 102]
 
 
+def test_v3_whole_file_delete_materializes_deleted_entry_first_row_id(v3_catalog: Catalog) -> None:
+    v3_catalog.create_namespace("ns")
+    tbl = v3_catalog.create_table("ns.t", schema=SCHEMA, properties={"format-version": "3"})
+
+    _append_data_files_in_one_manifest(tbl, [[0, 1, 2], [100, 101, 102]])
+    tbl = v3_catalog.load_table("ns.t")
+    assert _data_file_row_ids(tbl) == [(0, None, 3), (0, None, 3)]
+
+    tbl.delete(delete_filter="id >= 100")
+    tbl = v3_catalog.load_table("ns.t")
+
+    snap = tbl.metadata.current_snapshot()
+    assert snap is not None
+    deleted_entries = [
+        entry
+        for manifest in snap.manifests(tbl.io)
+        if manifest.content == ManifestContent.DATA
+        for entry in manifest.fetch_manifest_entry(tbl.io, discard_deleted=False)
+        if entry.status == ManifestEntryStatus.DELETED
+    ]
+
+    assert len(deleted_entries) == 1
+    deleted_file = deleted_entries[0].data_file
+    assert deleted_file.record_count == 3
+    assert deleted_file.first_row_id == 3
+
+
 def test_v3_partial_rewrite_delete_fails_loudly(v3_catalog: Catalog) -> None:
     """A copy-on-write delete that needs to REWRITE a data file must fail loudly on v3.
 
@@ -472,6 +499,26 @@ def test_v3_partial_rewrite_delete_fails_loudly(v3_catalog: Catalog) -> None:
         tbl.delete(delete_filter="id in (2, 3)")
 
     # The table state is unchanged (no corruption, no renumbering).
+    tbl = v3_catalog.load_table("ns.t")
+    assert tbl.metadata.next_row_id == 6
+    assert sorted(row["id"] for row in tbl.scan().to_arrow().to_pylist()) == [0, 1, 2, 3, 4, 5]
+
+
+def test_v3_partial_rewrite_delete_caught_in_transaction_stages_nothing(v3_catalog: Catalog) -> None:
+    v3_catalog.create_namespace("ns")
+    tbl = v3_catalog.create_table("ns.t", schema=SCHEMA, properties={"format-version": "3"})
+    tbl.append(_batch([0, 1, 2, 3, 4, 5]))
+    tbl = v3_catalog.load_table("ns.t")
+
+    raised = False
+    with tbl.transaction() as txn:
+        try:
+            txn.delete("id in (2, 3)")
+        except NotImplementedError as exc:
+            assert "copy-on-write delete" in str(exc)
+            raised = True
+
+    assert raised
     tbl = v3_catalog.load_table("ns.t")
     assert tbl.metadata.next_row_id == 6
     assert sorted(row["id"] for row in tbl.scan().to_arrow().to_pylist()) == [0, 1, 2, 3, 4, 5]

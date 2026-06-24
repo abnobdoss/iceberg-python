@@ -725,8 +725,8 @@ class Transaction:
         if isinstance(delete_filter, str):
             delete_filter = _parse_row_filter(delete_filter)
 
-        with self.update_snapshot(snapshot_properties=snapshot_properties, branch=branch).delete() as delete_snapshot:
-            delete_snapshot.delete_by_predicate(delete_filter, case_sensitive)
+        delete_snapshot = self.update_snapshot(snapshot_properties=snapshot_properties, branch=branch).delete()
+        delete_snapshot.delete_by_predicate(delete_filter, case_sensitive)
 
         # Check if there are any files that require an actual rewrite of a data file
         if delete_snapshot.rewrites_needed is True:
@@ -747,6 +747,9 @@ class Transaction:
                     "preserve survivors' row ids) are supported. Track: read-side _row_id "
                     "materialization."
                 )
+        delete_snapshot.commit()
+
+        if delete_snapshot.rewrites_needed is True:
             bound_delete_filter = bind(self.table_metadata.schema(), delete_filter, case_sensitive)
             preserve_row_filter = _expression_to_complementary_pyarrow(bound_delete_filter, self.table_metadata.schema())
 
