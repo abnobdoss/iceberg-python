@@ -182,10 +182,6 @@ class PuffinWriter:
             positions: Zero-based positions of the deleted rows in the referenced data file.
             referenced_data_file: Location of the data file the deletion vector applies to.
         """
-        # We only support one blob at the moment
-        self._blobs = []
-        self._blob_payloads = []
-
         bitmaps: dict[int, BitMap] = {}
         for pos in positions:
             if pos < 0:
@@ -205,24 +201,25 @@ class PuffinWriter:
         # deletion-vector-v1 blob layout: combined length of magic and vector (4 bytes, big-endian),
         # the DV magic bytes, the serialized vector, and a CRC-32 checksum of magic + vector (4 bytes, big-endian)
         blob_content = DELETION_VECTOR_MAGIC + vector_payload
-        self._blob_payloads.append(
-            len(blob_content).to_bytes(4, "big") + blob_content + zlib.crc32(blob_content).to_bytes(4, "big")
+        blob_payload = len(blob_content).to_bytes(4, "big") + blob_content + zlib.crc32(blob_content).to_bytes(4, "big")
+
+        blob_metadata = PuffinBlobMetadata(
+            type="deletion-vector-v1",
+            fields=[ROW_POSITION_FIELD_ID],
+            # -1 means the snapshot id and sequence number are inherited at commit time
+            snapshot_id=-1,
+            sequence_number=-1,
+            # offset and length are placeholders; finish() fills them in when assembling the file
+            offset=0,
+            length=0,
+            properties={PROPERTY_REFERENCED_DATA_FILE: referenced_data_file, "cardinality": str(cardinality)},
+            compression_codec=None,
         )
 
-        self._blobs.append(
-            PuffinBlobMetadata(
-                type="deletion-vector-v1",
-                fields=[ROW_POSITION_FIELD_ID],
-                # -1 means the snapshot id and sequence number are inherited at commit time
-                snapshot_id=-1,
-                sequence_number=-1,
-                # offset and length are placeholders; finish() fills them in when assembling the file
-                offset=0,
-                length=0,
-                properties={PROPERTY_REFERENCED_DATA_FILE: referenced_data_file, "cardinality": str(cardinality)},
-                compression_codec=None,
-            )
-        )
+        # Replace any previously set blob only after the new blob has been built and validated,
+        # so a failed call cannot discard an already-set blob. We only support one blob at the moment.
+        self._blobs = [blob_metadata]
+        self._blob_payloads = [blob_payload]
 
     def finish(self) -> int:
         """Write the Puffin file to the output file and return its size in bytes."""

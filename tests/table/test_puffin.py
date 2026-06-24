@@ -247,6 +247,44 @@ def test_dv_vector_body_is_portable_croaring(tmp_path: Path) -> None:
     assert cursor == len(vector_body)
 
 
+def test_dv_vector_body_byte_exact_portable_format(tmp_path: Path) -> None:
+    # Byte-exactness against the RoaringBitmap "portable" format the Iceberg/Puffin spec
+    # mandates, independent of pyroaring's own reader. The expected bytes are constructed
+    # by hand from the RoaringFormatSpec so this would fail if the writer ever emitted the
+    # non-portable (native CRoaring frame-of-reference) layout instead.
+    import struct
+
+    # A single key (0) whose sub-positions form an array container (no runs): {1, 5, 100, 7000}.
+    positions = [1, 5, 100, 7000]
+    writer, puffin_path = _new_writer(tmp_path)
+    writer.set_blob(positions=positions, referenced_data_file="file.parquet")
+    writer.finish()
+    puffin_bytes = puffin_path.read_bytes()
+
+    footer_payload_size = int.from_bytes(puffin_bytes[-12:-8], "little")
+    footer = json.loads(puffin_bytes[-(footer_payload_size + 12) : -12])
+    blob = footer["blobs"][0]
+    blob_bytes = puffin_bytes[blob["offset"] : blob["offset"] + blob["length"]]
+
+    length_prefix = int.from_bytes(blob_bytes[0:4], "big")
+    assert blob_bytes[4:8] == DELETION_VECTOR_MAGIC
+    vector_body = blob_bytes[8 : 4 + length_prefix]
+
+    # Portable 64-bit layout: 8-byte LE bitmap count, then 4-byte LE key, then the 32-bit
+    # portable RoaringBitmap. The 32-bit bitmap uses the SERIAL_COOKIE_NO_RUNCONTAINER
+    # (0x303a) array-container layout: cookie, container count, descriptive header
+    # (key, cardinality-1), the offset header, then explicit 16-bit values.
+    expected = struct.pack("<Q", 1)  # one 32-bit bitmap
+    expected += struct.pack("<I", 0)  # high key 0
+    expected += struct.pack("<I", 0x0000303A)  # no-run cookie
+    expected += struct.pack("<I", 1)  # one container
+    expected += struct.pack("<HH", 0, len(positions) - 1)  # container key 0, cardinality-1
+    expected += struct.pack("<I", 4 + 4 + 4 + 4)  # offset of container data after the header
+    expected += struct.pack(f"<{len(positions)}H", *positions)  # array container values
+
+    assert vector_body == expected
+
+
 def test_dv_duplicate_positions_deduped(tmp_path: Path) -> None:
     positions = [(1 << 32) + 3, 0, (1 << 32) + 3, 7, 0, (1 << 32), 7, 3]
     expected = sorted(set(positions))
@@ -349,3 +387,20 @@ def test_set_blob_rejects_position_exceeding_java_key_range(tmp_path: Path) -> N
     writer, _ = _new_writer(tmp_path)
     with pytest.raises(ValueError, match="Key 2147483648 is too large, max 2147483647"):
         writer.set_blob(positions=[(2**31) << 32], referenced_data_file="file.parquet")
+
+
+def test_set_blob_failure_preserves_previous_blob(tmp_path: Path) -> None:
+    writer, puffin_path = _new_writer(tmp_path)
+    writer.set_blob(positions=[1, 2, 3], referenced_data_file="good.parquet")
+
+    with pytest.raises(ValueError, match="Invalid position: -1"):
+        writer.set_blob(positions=[5, -1], referenced_data_file="bad.parquet")
+
+    writer.finish()
+
+    reader = PuffinFile(puffin_path.read_bytes())
+    assert len(reader.footer.blobs) == 1
+    assert reader.footer.blobs[0].properties[PROPERTY_REFERENCED_DATA_FILE] == "good.parquet"
+    vectors = reader.to_vector()
+    assert "bad.parquet" not in vectors
+    assert vectors["good.parquet"].to_pylist() == [1, 2, 3]
