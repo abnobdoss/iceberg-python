@@ -833,8 +833,12 @@ class Transaction:
                 row_positions = pa.array(range(current_index, current_index + batch.num_rows), type=pa.int64())
                 current_index += batch.num_rows
 
-                batch_with_positions = pa.Table.from_batches([batch]).append_column("__pyiceberg_position", row_positions)
-                matching_positions = batch_with_positions.filter(pyarrow_filter).column("__pyiceberg_position").to_pylist()
+                position_column_name = "__pyiceberg_position"
+                while position_column_name in batch.schema.names:
+                    position_column_name += "_"
+
+                batch_with_positions = pa.Table.from_batches([batch]).append_column(position_column_name, row_positions)
+                matching_positions = batch_with_positions.filter(pyarrow_filter).column(position_column_name).to_pylist()
                 positions_to_delete = {int(pos) for pos in matching_positions if int(pos) not in existing_deleted_positions}
 
                 if positions_to_delete:
