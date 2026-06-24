@@ -139,6 +139,51 @@ def test_write_position_delete_file_empty_positions_raises(catalog: Catalog) -> 
         write_position_delete_file(table.io, table.metadata, data_file, [])
 
 
+def test_write_position_delete_file_negative_position_raises(catalog: Catalog) -> None:
+    table = _create_v2_table(catalog, "default.test_write_position_delete_file_negative_position")
+    data_file = _append_initial_rows(table)
+
+    with pytest.raises(ValueError, match="non-negative"):
+        write_position_delete_file(table.io, table.metadata, data_file, [-1])
+
+
+def test_write_position_delete_file_rejects_non_data_reference(catalog: Catalog) -> None:
+    table = _create_v2_table(catalog, "default.test_write_position_delete_file_rejects_non_data_reference")
+    data_file = _append_initial_rows(table)
+    delete_file = write_position_delete_file(table.io, table.metadata, data_file, [0])
+
+    with pytest.raises(ValueError, match="referenced_data_file must be a DATA file"):
+        write_position_delete_file(table.io, table.metadata, delete_file, [0])
+
+
+def test_write_position_delete_file_falls_back_to_default_spec_id(catalog: Catalog) -> None:
+    table = _create_v2_table(catalog, "default.test_write_position_delete_file_falls_back_to_default_spec_id")
+    data_file = _append_initial_rows(table)
+    fresh_data_file = DataFile.from_args(
+        _table_format_version=table.metadata.format_version,
+        content=data_file.content,
+        file_path=data_file.file_path,
+        file_format=data_file.file_format,
+        partition=data_file.partition,
+        record_count=data_file.record_count,
+        file_size_in_bytes=data_file.file_size_in_bytes,
+        column_sizes=data_file.column_sizes,
+        value_counts=data_file.value_counts,
+        null_value_counts=data_file.null_value_counts,
+        nan_value_counts=data_file.nan_value_counts,
+        lower_bounds=data_file.lower_bounds,
+        upper_bounds=data_file.upper_bounds,
+        key_metadata=data_file.key_metadata,
+        split_offsets=data_file.split_offsets,
+        equality_ids=data_file.equality_ids,
+        sort_order_id=data_file.sort_order_id,
+    )
+
+    delete_file = write_position_delete_file(table.io, table.metadata, fresh_data_file, [0])
+
+    assert delete_file.spec_id == table.metadata.default_spec_id
+
+
 def test_write_position_delete_file_dedupes_and_sorts_positions(catalog: Catalog) -> None:
     table = _create_v2_table(catalog, "default.test_write_position_delete_file_dedupes")
     data_file = _append_initial_rows(table)
@@ -181,6 +226,14 @@ def test_write_position_delete_file_accepts_large_position(catalog: Catalog) -> 
     assert delete_file.record_count == 1
     _, rows = _read_delete_parquet(table, delete_file)
     assert rows.column("pos").to_pylist() == [large_position]
+
+
+def test_append_delete_file_rejects_data_file(catalog: Catalog) -> None:
+    table = _create_v2_table(catalog, "default.test_append_delete_file_rejects_data_file")
+    data_file = _append_initial_rows(table)
+
+    with pytest.raises(ValueError, match="append_delete_file requires a delete file"):
+        _commit_delete_file(table, data_file)
 
 
 def test_position_delete_sequence_number_does_not_affect_later_appends(catalog: Catalog) -> None:
