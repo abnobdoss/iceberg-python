@@ -921,6 +921,7 @@ def test_duckdb_url_import(warehouse: Path, arrow_table_with_null: pa.Table) -> 
             b"\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11",
         ),
     ]
+    catalog.close()
 
 
 @pytest.mark.integration
@@ -2384,6 +2385,8 @@ def test_nanosecond_support_on_catalog(
         _create_table(
             session_catalog, identifier, {"format-version": "2"}, schema=arrow_table_schema_with_all_timestamp_precisions
         )
+
+    catalog.close()
 
 
 @pytest.mark.integration
