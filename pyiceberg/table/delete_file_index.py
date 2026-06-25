@@ -78,6 +78,12 @@ def _applies_to_data_file(delete_file: DataFile, data_file: DataFile) -> bool:
 
 def _referenced_data_file_path(delete_file: DataFile) -> str | None:
     """Return the path, if the path bounds evaluate to the same location."""
+    # Deletion vectors (and any delete file that targets a single data file) carry the
+    # referenced data file path explicitly in field 143. Prefer it when present.
+    referenced = delete_file.referenced_data_file
+    if referenced is not None:
+        return referenced
+
     lower_bounds = delete_file.lower_bounds
     upper_bounds = delete_file.upper_bounds
 

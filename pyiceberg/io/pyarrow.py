@@ -2613,6 +2613,49 @@ def data_file_statistics_from_parquet_metadata(
     )
 
 
+def _geospatial_bounds_from_arrow(schema: Schema, arrow_table: pa.Table) -> tuple[dict[int, bytes], dict[int, bytes]]:
+    """Compute v3 geospatial lower/upper bounds for any geometry/geography columns.
+
+    Geometry/geography values are stored as WKB. Parquet column statistics cannot
+    bound WKB blobs spatially, so the bounds are derived by extracting each value's
+    envelope. Returns ``(lower_bounds, upper_bounds)`` keyed by field id, serialized
+    per the spec (little-endian doubles). Columns with no extractable geometry are
+    skipped.
+    """
+    from pyiceberg.types import GeographyType, GeometryType
+    from pyiceberg.utils.geospatial import GeospatialStatsAggregator
+
+    lower: dict[int, bytes] = {}
+    upper: dict[int, bytes] = {}
+
+    for field in schema.as_struct().fields:
+        if not isinstance(field.field_type, (GeometryType, GeographyType)):
+            continue
+        if field.name not in arrow_table.column_names:
+            continue
+
+        is_geography = isinstance(field.field_type, GeographyType)
+        aggregator = GeospatialStatsAggregator(is_geography=is_geography)
+        column = arrow_table.column(field.name)
+        # Geometry/geography columns are WKB. When geoarrow-pyarrow is present the
+        # column is a WKB extension type whose storage holds the raw WKB bytes; unwrap
+        # it so the envelope extractor sees bytes rather than parsed geometry objects.
+        for chunk in column.chunks:
+            storage = chunk.storage if isinstance(chunk.type, pa.ExtensionType) else chunk
+            for value in storage.to_pylist():
+                if value is None:
+                    continue
+                aggregator.add(bytes(value))
+
+        serialized_min = aggregator.serialized_min()
+        serialized_max = aggregator.serialized_max()
+        if serialized_min is not None and serialized_max is not None:
+            lower[field.field_id] = serialized_min
+            upper[field.field_id] = serialized_max
+
+    return lower, upper
+
+
 def write_file(io: FileIO, table_metadata: TableMetadata, tasks: Iterator[WriteTask]) -> Iterator[DataFile]:
     from pyiceberg.table import DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE, TableProperties
 
@@ -2660,6 +2703,16 @@ def write_file(io: FileIO, table_metadata: TableMetadata, tasks: Iterator[WriteT
             stats_columns=compute_statistics_plan(file_schema, table_metadata.properties),
             parquet_column_mapping=parquet_path_to_id_mapping(file_schema),
         )
+        serialized_stats = statistics.to_serialized_dict()
+
+        # v3 geospatial bounds: parquet column stats cannot bound WKB spatially, so
+        # derive lower/upper bounds from the geometry/geography column envelopes and
+        # merge them into the data file bounds.
+        geo_lower, geo_upper = _geospatial_bounds_from_arrow(file_schema, arrow_table)
+        if geo_lower:
+            serialized_stats["lower_bounds"] = {**serialized_stats.get("lower_bounds", {}), **geo_lower}
+            serialized_stats["upper_bounds"] = {**serialized_stats.get("upper_bounds", {}), **geo_upper}
+
         data_file = DataFile.from_args(
             content=DataFileContent.DATA,
             file_path=file_path,
@@ -2674,7 +2727,7 @@ def write_file(io: FileIO, table_metadata: TableMetadata, tasks: Iterator[WriteT
             spec_id=table_metadata.default_spec_id,
             equality_ids=None,
             key_metadata=None,
-            **statistics.to_serialized_dict(),
+            **serialized_stats,
         )
 
         return data_file

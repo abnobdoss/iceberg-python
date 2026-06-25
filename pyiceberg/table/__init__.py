@@ -48,7 +48,7 @@ from pyiceberg.table.delete_file_index import DeleteFileIndex
 from pyiceberg.table.inspect import InspectTable
 from pyiceberg.table.locations import LocationProvider, load_location_provider
 from pyiceberg.table.maintenance import MaintenanceTable
-from pyiceberg.table.metadata import INITIAL_SEQUENCE_NUMBER, TableMetadata
+from pyiceberg.table.metadata import INITIAL_SEQUENCE_NUMBER, SUPPORTED_TABLE_FORMAT_VERSION, TableMetadata
 from pyiceberg.table.name_mapping import NameMapping
 from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef
 from pyiceberg.table.snapshots import Snapshot, SnapshotLogEntry
@@ -293,7 +293,7 @@ class Transaction:
         Returns:
             The alter table builder.
         """
-        if format_version not in {1, 2}:
+        if not 1 <= format_version <= SUPPORTED_TABLE_FORMAT_VERSION:
             raise ValueError(f"Unsupported table format version: {format_version}")
 
         if format_version < self.table_metadata.format_version:
@@ -730,6 +730,23 @@ class Transaction:
 
         # Check if there are any files that require an actual rewrite of a data file
         if delete_snapshot.rewrites_needed is True:
+            if self.table_metadata.format_version >= 3:
+                # A partial (copy-on-write) delete physically rewrites surviving rows into a
+                # NEW data file. Per the v3 spec those rows must KEEP their original _row_id
+                # (field 142 / the _row_id metadata column). After a partial delete the
+                # survivors are generally non-contiguous (e.g. 0,1,4,5), so their lineage can
+                # only be preserved by materializing an explicit per-row _row_id column on read
+                # and persisting it on rewrite. PyIceberg has no read-side _row_id
+                # materialization yet, so doing this rewrite would silently RE-NUMBER the
+                # surviving rows and corrupt row lineage. We fail loudly instead.
+                raise NotImplementedError(
+                    "v3 copy-on-write delete that requires rewriting a data file is not "
+                    "supported yet: surviving rows would lose their _row_id lineage because "
+                    "PyIceberg cannot materialize/preserve per-row _row_id (field 142) across a "
+                    "physical rewrite. Whole-file deletes (which drop entire data files and "
+                    "preserve survivors' row ids) are supported. Track: read-side _row_id "
+                    "materialization."
+                )
             bound_delete_filter = bind(self.table_metadata.schema(), delete_filter, case_sensitive)
             preserve_row_filter = _expression_to_complementary_pyarrow(bound_delete_filter, self.table_metadata.schema())
 
