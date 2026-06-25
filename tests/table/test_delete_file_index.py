@@ -16,12 +16,22 @@
 # under the License.
 import pytest
 
+from pyiceberg.conversions import to_bytes
 from pyiceberg.manifest import DataFile, DataFileContent, FileFormat, ManifestEntry, ManifestEntryStatus
+from pyiceberg.schema import Schema
 from pyiceberg.table.delete_file_index import PATH_FIELD_ID, DeleteFileIndex, PositionDeletes
 from pyiceberg.typedef import Record
+from pyiceberg.types import IntegerType, NestedField
 
 
-def _create_data_file(file_path: str = "s3://bucket/data.parquet", spec_id: int = 0) -> DataFile:
+def _create_data_file(
+    file_path: str = "s3://bucket/data.parquet",
+    spec_id: int = 0,
+    lower_bounds: dict[int, bytes] | None = None,
+    upper_bounds: dict[int, bytes] | None = None,
+    null_value_counts: dict[int, int] | None = None,
+    value_counts: dict[int, int] | None = None,
+) -> DataFile:
     data_file = DataFile.from_args(
         content=DataFileContent.DATA,
         file_path=file_path,
@@ -29,6 +39,10 @@ def _create_data_file(file_path: str = "s3://bucket/data.parquet", spec_id: int 
         partition=Record(),
         record_count=100,
         file_size_in_bytes=1000,
+        lower_bounds=lower_bounds,
+        upper_bounds=upper_bounds,
+        null_value_counts=null_value_counts,
+        value_counts=value_counts,
     )
     data_file._spec_id = spec_id
     return data_file
@@ -76,6 +90,31 @@ def _create_deletion_vector(
         file_size_in_bytes=100,
         lower_bounds={PATH_FIELD_ID: file_path.encode()},
         upper_bounds={PATH_FIELD_ID: file_path.encode()},
+    )
+    delete_file._spec_id = spec_id
+    return ManifestEntry.from_args(status=ManifestEntryStatus.ADDED, sequence_number=sequence_number, data_file=delete_file)
+
+
+def _create_equality_delete(
+    sequence_number: int = 1,
+    spec_id: int = 0,
+    lower_bounds: dict[int, bytes] | None = None,
+    upper_bounds: dict[int, bytes] | None = None,
+    null_value_counts: dict[int, int] | None = None,
+    value_counts: dict[int, int] | None = None,
+) -> ManifestEntry:
+    delete_file = DataFile.from_args(
+        content=DataFileContent.EQUALITY_DELETES,
+        file_path=f"s3://bucket/eq-delete-{sequence_number}.parquet",
+        file_format=FileFormat.PARQUET,
+        partition=Record(),
+        record_count=10,
+        file_size_in_bytes=100,
+        equality_ids=[1],
+        lower_bounds=lower_bounds,
+        upper_bounds=upper_bounds,
+        null_value_counts=null_value_counts,
+        value_counts=value_counts,
     )
     delete_file._spec_id = spec_id
     return ManifestEntry.from_args(status=ManifestEntryStatus.ADDED, sequence_number=sequence_number, data_file=delete_file)
@@ -187,3 +226,54 @@ def test_record_equality_for_partition_lookup() -> None:
 
     assert len(index.for_data_file(1, data_file, partition_b)) == 1
     assert len(index.for_data_file(1, data_file, partition_c)) == 0
+
+
+def test_equality_delete_sequence_number_filtering() -> None:
+    index = DeleteFileIndex()
+    eq_delete = _create_equality_delete(sequence_number=2)
+    index.add_delete_file(eq_delete)
+
+    data_file = _create_data_file()
+
+    assert eq_delete.data_file in index.for_data_file(1, data_file)
+    assert eq_delete.data_file not in index.for_data_file(2, data_file)
+    assert eq_delete.data_file not in index.for_data_file(3, data_file)
+
+
+def test_equality_delete_metrics_filtering() -> None:
+    schema = Schema(NestedField(1, "id", IntegerType(), required=True))
+    index = DeleteFileIndex(schema=schema)
+    eq_delete = _create_equality_delete(
+        sequence_number=100,
+        lower_bounds={1: to_bytes(IntegerType(), 10)},
+        upper_bounds={1: to_bytes(IntegerType(), 20)},
+    )
+    index.add_delete_file(eq_delete)
+
+    no_overlap = _create_data_file(
+        "s3://bucket/no-overlap.parquet",
+        lower_bounds={1: to_bytes(IntegerType(), 0)},
+        upper_bounds={1: to_bytes(IntegerType(), 5)},
+    )
+    overlap = _create_data_file(
+        "s3://bucket/overlap.parquet",
+        lower_bounds={1: to_bytes(IntegerType(), 15)},
+        upper_bounds={1: to_bytes(IntegerType(), 25)},
+    )
+
+    assert eq_delete.data_file not in index.for_data_file(1, no_overlap)
+    assert eq_delete.data_file in index.for_data_file(1, overlap)
+
+
+def test_equality_delete_null_count_filtering() -> None:
+    schema = Schema(NestedField(1, "id", IntegerType(), required=False))
+    index = DeleteFileIndex(schema=schema)
+    eq_delete = _create_equality_delete(
+        sequence_number=10,
+        null_value_counts={1: 10},
+        value_counts={1: 10},
+    )
+    index.add_delete_file(eq_delete)
+    data_file = _create_data_file(null_value_counts={1: 0}, value_counts={1: 100})
+
+    assert eq_delete.data_file not in index.for_data_file(1, data_file)
