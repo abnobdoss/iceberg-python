@@ -27,12 +27,29 @@ from pyiceberg.typedef import UTF8
 from pyiceberg.utils.config import Config
 
 GZIP = "gzip"
+NONE = "none"
 
 
 class Compressor(ABC):
     @staticmethod
     def get_compressor(location: str) -> Compressor:
+        # An unknown codec extension (e.g. ".lz4.metadata.json") falls through to NOOP,
+        # matching Java's TableMetadataParser.Codec.fromFileName, which treats any
+        # non-".gz" infix as NONE.
         return GzipCompressor() if location.endswith(".gz.metadata.json") else NOOP_COMPRESSOR
+
+    @staticmethod
+    def from_codec_name(codec_name: str | None) -> Compressor:
+        if codec_name is None:
+            return NOOP_COMPRESSOR
+
+        normalized_codec_name = codec_name.lower()
+        if normalized_codec_name == NONE:
+            return NOOP_COMPRESSOR
+        elif normalized_codec_name == GZIP:
+            return GzipCompressor()
+        else:
+            raise ValueError(f"Unsupported metadata compression codec: {codec_name}")
 
     @abstractmethod
     def stream_decompressor(self, inp: InputStream) -> InputStream:
@@ -71,6 +88,16 @@ class GzipCompressor(Compressor):
 
     def bytes_compressor(self) -> Callable[[bytes], bytes]:
         return gzip.compress
+
+
+def metadata_file_extension(codec_name: str | None) -> str:
+    Compressor.from_codec_name(codec_name)
+
+    normalized_codec_name = NONE if codec_name is None else codec_name.lower()
+    return {
+        NONE: ".metadata.json",
+        GZIP: ".gz.metadata.json",
+    }[normalized_codec_name]
 
 
 class FromByteStream:

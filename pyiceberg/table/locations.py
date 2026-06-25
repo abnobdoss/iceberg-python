@@ -85,7 +85,14 @@ class LocationProvider(ABC):
         if new_version < 0:
             raise ValueError(f"Table metadata version: `{new_version}` must be a non-negative integer")
 
-        file_name = f"{new_version:05d}-{uuid.uuid4()}.metadata.json"
+        from pyiceberg.serializers import metadata_file_extension
+        from pyiceberg.table import TableProperties
+
+        codec = self.table_properties.get(
+            TableProperties.WRITE_METADATA_COMPRESSION, TableProperties.WRITE_METADATA_COMPRESSION_DEFAULT
+        )
+        suffix = metadata_file_extension(codec)
+        file_name = f"{new_version:05d}-{uuid.uuid4()}{suffix}"
         return self.new_metadata_location(file_name)
 
     def new_metadata_location(self, metadata_file_name: str) -> str:

@@ -174,6 +174,8 @@ class TableProperties:
     WRITE_FILE_FORMAT = "write.format.default"
     WRITE_FILE_FORMAT_DEFAULT = "parquet"
     WRITE_METADATA_PATH = "write.metadata.path"
+    WRITE_METADATA_COMPRESSION = "write.metadata.compression-codec"
+    WRITE_METADATA_COMPRESSION_DEFAULT = "none"
 
     DELETE_MODE = "write.delete.mode"
     DELETE_MODE_COPY_ON_WRITE = "copy-on-write"
