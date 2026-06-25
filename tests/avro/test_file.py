@@ -164,6 +164,8 @@ def test_write_manifest_entry_with_iceberg_read_with_fastavro_v1() -> None:
         del v2_entry["file_sequence_number"]
         del v2_entry["data_file"]["content"]
         del v2_entry["data_file"]["equality_ids"]
+        # first_row_id (field 142) is a v3-only DataFile field, not present in the V1/V2 schema.
+        v2_entry["data_file"].pop("first_row_id", None)
 
         # Required in V1
         v2_entry["data_file"]["block_size_in_bytes"] = DEFAULT_BLOCK_SIZE
@@ -222,7 +224,10 @@ def test_write_manifest_entry_with_iceberg_read_with_fastavro_v2() -> None:
 
             fa_entry = next(it)
 
-        assert todict(entry) == fa_entry
+        v2_entry = todict(entry)
+        # first_row_id (field 142) is a v3-only DataFile field, not present in the V2 schema.
+        v2_entry["data_file"].pop("first_row_id", None)
+        assert v2_entry == fa_entry
 
 
 @pytest.mark.parametrize("format_version", [1, 2])

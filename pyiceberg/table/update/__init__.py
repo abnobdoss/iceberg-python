@@ -29,7 +29,7 @@ from pydantic import Field, field_validator, model_serializer, model_validator
 from pyiceberg.exceptions import CommitFailedException
 from pyiceberg.partitioning import PARTITION_FIELD_ID_START, PartitionSpec
 from pyiceberg.schema import Schema
-from pyiceberg.table.metadata import SUPPORTED_TABLE_FORMAT_VERSION, TableMetadata, TableMetadataUtil
+from pyiceberg.table.metadata import SUPPORTED_TABLE_FORMAT_VERSION, TableMetadata, TableMetadataUtil, TableMetadataV3
 from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef, SnapshotRefType
 from pyiceberg.table.snapshots import (
     MetadataLogEntry,
@@ -322,9 +322,16 @@ def _(
         return base_metadata
 
     updated_metadata = base_metadata.model_copy(update={"format_version": update.format_version})
+    updated_metadata = TableMetadataUtil._construct_without_validation(updated_metadata)
+    if (
+        isinstance(updated_metadata, TableMetadataV3)
+        and base_metadata.format_version < 3
+        and updated_metadata.next_row_id is None
+    ):
+        updated_metadata = updated_metadata.model_copy(update={"next_row_id": 0})
 
     context.add_update(update)
-    return TableMetadataUtil._construct_without_validation(updated_metadata)
+    return updated_metadata
 
 
 @_apply_table_update.register(SetPropertiesUpdate)
@@ -435,7 +442,7 @@ def _(update: AddSnapshotUpdate, base_metadata: TableMetadata, context: _TableMe
     elif base_metadata.snapshot_by_id(update.snapshot.snapshot_id) is not None:
         raise ValueError(f"Snapshot with id {update.snapshot.snapshot_id} already exists")
     elif (
-        base_metadata.format_version == 2
+        base_metadata.format_version >= 2
         and update.snapshot.sequence_number is not None
         and update.snapshot.sequence_number <= base_metadata.last_sequence_number
         and update.snapshot.parent_snapshot_id is not None
@@ -446,6 +453,10 @@ def _(update: AddSnapshotUpdate, base_metadata: TableMetadata, context: _TableMe
         )
     elif base_metadata.format_version >= 3 and update.snapshot.first_row_id is None:
         raise ValueError("Cannot add snapshot without first row id")
+    elif base_metadata.format_version >= 3 and update.snapshot.added_rows is None:
+        raise ValueError("Cannot add snapshot without added rows")
+    elif base_metadata.format_version >= 3 and base_metadata.next_row_id is None:
+        raise ValueError("Cannot add a snapshot when table next-row-id is null")
     elif (
         base_metadata.format_version >= 3
         and update.snapshot.first_row_id is not None
@@ -458,18 +469,21 @@ def _(update: AddSnapshotUpdate, base_metadata: TableMetadata, context: _TableMe
         )
 
     context.add_update(update)
-    return base_metadata.model_copy(
-        update={
-            "last_updated_ms": update.snapshot.timestamp_ms,
-            "last_sequence_number": update.snapshot.sequence_number,
-            "snapshots": base_metadata.snapshots + [update.snapshot],
-            "next_row_id": base_metadata.next_row_id + update.snapshot.added_rows
-            if base_metadata.format_version >= 3
-            and base_metadata.next_row_id is not None
-            and update.snapshot.added_rows is not None
-            else None,
-        }
-    )
+    metadata_updates: dict[str, Any] = {
+        "last_updated_ms": update.snapshot.timestamp_ms,
+        "last_sequence_number": update.snapshot.sequence_number,
+        "snapshots": base_metadata.snapshots + [update.snapshot],
+    }
+    if base_metadata.format_version >= 3:
+        if base_metadata.next_row_id is None:
+            raise ValueError("Cannot add a snapshot when table next-row-id is null")
+        if update.snapshot.added_rows is None:
+            raise ValueError("Cannot add snapshot without added rows")
+        if update.snapshot.first_row_id is None:
+            raise ValueError("Cannot add snapshot without first row id")
+        metadata_updates["next_row_id"] = update.snapshot.first_row_id + update.snapshot.added_rows
+
+    return base_metadata.model_copy(update=metadata_updates)
 
 
 @_apply_table_update.register(SetSnapshotRefUpdate)

@@ -21,6 +21,7 @@ import uuid
 from abc import abstractmethod
 from collections import defaultdict
 from collections.abc import Callable
+from copy import copy
 from datetime import datetime
 from functools import cached_property
 from typing import TYPE_CHECKING, Generic
@@ -264,8 +265,9 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         )
 
     def _commit(self) -> UpdatesAndRequirements:
+        table_metadata = self._transaction.table_metadata
         new_manifests = self._manifests()
-        next_sequence_number = self._transaction.table_metadata.next_sequence_number()
+        next_sequence_number = table_metadata.next_sequence_number()
 
         summary = self._summary(self.snapshot_properties)
         file_name = _new_manifest_list_file_name(
@@ -276,20 +278,31 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         location_provider = self._transaction._table.location_provider()
         manifest_list_file_path = location_provider.new_metadata_location(file_name)
 
+        if table_metadata.format_version >= 3:
+            snapshot_first_row_id = table_metadata.next_row_id
+            if snapshot_first_row_id is None:
+                raise ValueError("Cannot commit to a v3 table without next-row-id")
+        else:
+            snapshot_first_row_id = None
+
         with write_manifest_list(
-            format_version=self._transaction.table_metadata.format_version,
+            format_version=table_metadata.format_version,
             output_file=self._io.new_output(manifest_list_file_path),
             snapshot_id=self._snapshot_id,
             parent_snapshot_id=self._parent_snapshot_id,
             sequence_number=next_sequence_number,
             avro_compression=self._compression,
+            snapshot_first_row_id=snapshot_first_row_id,
         ) as writer:
             writer.add_manifests(new_manifests)
 
-        first_row_id: int | None = None
-
-        if self._transaction.table_metadata.format_version >= 3:
-            first_row_id = self._transaction.table_metadata.next_row_id
+        if table_metadata.format_version >= 3:
+            if writer.next_row_id is None or snapshot_first_row_id is None:
+                raise ValueError("Cannot determine added rows for a v3 snapshot without row IDs")
+            added_rows = writer.next_row_id - snapshot_first_row_id
+        else:
+            added_rows = None
+        first_row_id = snapshot_first_row_id
 
         snapshot = Snapshot(
             snapshot_id=self._snapshot_id,
@@ -297,8 +310,9 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             manifest_list=manifest_list_file_path,
             sequence_number=next_sequence_number,
             summary=summary,
-            schema_id=self._transaction.table_metadata.current_schema_id,
+            schema_id=table_metadata.current_schema_id,
             first_row_id=first_row_id,
+            added_rows=added_rows,
         )
 
         add_snapshot_update = AddSnapshotUpdate(snapshot=snapshot)
@@ -415,7 +429,9 @@ class _DeleteFiles(_SnapshotProducer["_DeleteFiles"]):
             - Flag indicating that rewrites of data-files are needed.
         """
 
-        def _copy_with_new_status(entry: ManifestEntry, status: ManifestEntryStatus) -> ManifestEntry:
+        def _copy_with_new_status(
+            entry: ManifestEntry, status: ManifestEntryStatus, data_file: DataFile | None = None
+        ) -> ManifestEntry:
             return ManifestEntry.from_args(
                 status=status,
                 # When a file is replaced or deleted from the dataset, its manifest entry fields store the
@@ -423,11 +439,12 @@ class _DeleteFiles(_SnapshotProducer["_DeleteFiles"]):
                 snapshot_id=self.snapshot_id if status == ManifestEntryStatus.DELETED else entry.snapshot_id,
                 sequence_number=entry.sequence_number,
                 file_sequence_number=entry.file_sequence_number,
-                data_file=entry.data_file,
+                data_file=data_file if data_file is not None else entry.data_file,
             )
 
         # avoid copying metadata for each evaluator
         table_metadata = self._transaction.table_metadata
+        is_v3 = table_metadata.format_version >= 3
         schema = table_metadata.schema()
 
         manifest_evaluators: dict[int, Callable[[ManifestFile], bool]] = KeyDefaultDict(self._build_manifest_evaluator)
@@ -456,16 +473,59 @@ class _DeleteFiles(_SnapshotProducer["_DeleteFiles"]):
                             # It is relevant, let's check out the content
                             deleted_entries = []
                             existing_entries = []
+                            # For v3 tables, surviving data files must KEEP the row ids they were
+                            # already assigned. Rewriting the manifest would otherwise let the
+                            # manifest-list writer re-number them (the source manifest's
+                            # first_row_id is dropped). We materialize each surviving file's
+                            # absolute _row_id into DataFile field 142 so it survives the rewrite.
+                            # A file inherits row id = manifest.first_row_id + sum(record_count of
+                            # all preceding data files in the manifest), unless it already carries
+                            # an explicit field-142 value.
+                            row_id_cursor: int | None = manifest_file.first_row_id if is_v3 else None
                             for entry in manifest_file.fetch_manifest_entry(io=self._io, discard_deleted=True):
+                                materialized_data_file = entry.data_file
+                                if is_v3:
+                                    explicit_first_row_id = materialized_data_file.first_row_id
+                                    if explicit_first_row_id is not None:
+                                        row_id_cursor = explicit_first_row_id
+                                    if row_id_cursor is None:
+                                        raise NotImplementedError(
+                                            "Cannot perform a v3 copy-on-write delete that preserves row "
+                                            "lineage: the source manifest is missing a first_row_id and "
+                                            f"the data file {materialized_data_file.file_path} has no "
+                                            "explicit field-142 first_row_id, so surviving rows cannot be "
+                                            "renumber-safely rewritten."
+                                        )
+                                    if explicit_first_row_id is None:
+                                        # Persist the inherited absolute row id so it survives the rewrite.
+                                        materialized_data_file = copy(materialized_data_file)
+                                        materialized_data_file.first_row_id = row_id_cursor
                                 if strict_metrics_evaluator(entry.data_file) == ROWS_MUST_MATCH:
                                     # Based on the metadata, it can be dropped right away
-                                    deleted_entries.append(_copy_with_new_status(entry, ManifestEntryStatus.DELETED))
+                                    deleted_entries.append(
+                                        _copy_with_new_status(
+                                            entry,
+                                            ManifestEntryStatus.DELETED,
+                                            materialized_data_file if is_v3 else entry.data_file,
+                                        )
+                                    )
                                     self._deleted_data_files.add(entry.data_file)
                                 else:
                                     # Based on the metadata, we cannot determine if it can be deleted
-                                    existing_entries.append(_copy_with_new_status(entry, ManifestEntryStatus.EXISTING))
+                                    surviving_entry = _copy_with_new_status(entry, ManifestEntryStatus.EXISTING)
+                                    if is_v3:
+                                        surviving_entry = ManifestEntry.from_args(
+                                            status=surviving_entry.status,
+                                            snapshot_id=surviving_entry.snapshot_id,
+                                            sequence_number=surviving_entry.sequence_number,
+                                            file_sequence_number=surviving_entry.file_sequence_number,
+                                            data_file=materialized_data_file,
+                                        )
+                                    existing_entries.append(surviving_entry)
                                     if inclusive_metrics_evaluator(entry.data_file) != ROWS_MIGHT_NOT_MATCH:
                                         partial_rewrites_needed = True
+                                if is_v3 and row_id_cursor is not None:
+                                    row_id_cursor += materialized_data_file.record_count
 
                             if len(deleted_entries) > 0:
                                 total_deleted_entries += deleted_entries
@@ -475,7 +535,15 @@ class _DeleteFiles(_SnapshotProducer["_DeleteFiles"]):
                                     with self.new_manifest_writer(spec=self.spec(manifest_file.partition_spec_id)) as writer:
                                         for existing_entry in existing_entries:
                                             writer.add_entry(existing_entry)
-                                    existing_manifests.append(writer.to_manifest_file())
+                                    rewritten_manifest = writer.to_manifest_file()
+                                    if is_v3:
+                                        # Every surviving data file now carries its own field-142
+                                        # row id, so the manifest-list writer must NOT re-assign a
+                                        # block. Inherit the source manifest's first_row_id (its
+                                        # range start) to keep the manifest itself row-id stable and
+                                        # prevent re-numbering of survivors.
+                                        rewritten_manifest.first_row_id = manifest_file.first_row_id
+                                    existing_manifests.append(rewritten_manifest)
                             else:
                                 existing_manifests.append(manifest_file)
                     else:
@@ -592,6 +660,7 @@ class _OverwriteFiles(_SnapshotProducer["_OverwriteFiles"]):
         """Determine if there are any existing manifest files."""
         existing_files = []
 
+        is_v3 = self._transaction.table_metadata.format_version >= 3
         manifest_evaluators: dict[int, Callable[[ManifestFile], bool]] = KeyDefaultDict(self._build_manifest_evaluator)
         if snapshot := self._transaction.table_metadata.snapshot_by_name(name=self._target_branch):
             for manifest_file in snapshot.manifests(io=self._io):
@@ -600,14 +669,9 @@ class _OverwriteFiles(_SnapshotProducer["_OverwriteFiles"]):
                     existing_files.append(manifest_file)
                     continue
 
-                entries_to_write: set[ManifestEntry] = set()
-                found_deleted_entries: set[ManifestEntry] = set()
-
-                for entry in manifest_file.fetch_manifest_entry(io=self._io, discard_deleted=True):
-                    if entry.data_file in self._deleted_data_files:
-                        found_deleted_entries.add(entry)
-                    else:
-                        entries_to_write.add(entry)
+                is_v3_data_manifest = is_v3 and manifest_file.content == ManifestContent.DATA
+                live_entries = manifest_file.fetch_manifest_entry(io=self._io, discard_deleted=True)
+                found_deleted_entries = [entry for entry in live_entries if entry.data_file in self._deleted_data_files]
 
                 # Is the intercept the empty set?
                 if len(found_deleted_entries) == 0:
@@ -615,22 +679,49 @@ class _OverwriteFiles(_SnapshotProducer["_OverwriteFiles"]):
                     continue
 
                 # Delete all files from manifest
-                if len(entries_to_write) == 0:
+                if len(found_deleted_entries) == len(live_entries):
                     continue
 
-                # We have to rewrite the manifest file without the deleted data files
-                with self.new_manifest_writer(self.spec(manifest_file.partition_spec_id)) as writer:
-                    for entry in entries_to_write:
-                        writer.add_entry(
+                entries_to_write: list[ManifestEntry] = []
+                row_id_cursor: int | None = manifest_file.first_row_id if is_v3_data_manifest else None
+                for entry in live_entries:
+                    materialized_data_file = entry.data_file
+                    if is_v3_data_manifest:
+                        explicit_first_row_id = materialized_data_file.first_row_id
+                        if explicit_first_row_id is not None:
+                            row_id_cursor = explicit_first_row_id
+                        if entry.data_file not in self._deleted_data_files:
+                            if row_id_cursor is None:
+                                raise NotImplementedError(
+                                    "Cannot perform a v3 overwrite that preserves row lineage: the source "
+                                    "manifest is missing a first_row_id and the surviving data file "
+                                    f"{materialized_data_file.file_path} has no explicit field-142 "
+                                    "first_row_id."
+                                )
+                            if explicit_first_row_id is None:
+                                materialized_data_file = copy(materialized_data_file)
+                                materialized_data_file.first_row_id = row_id_cursor
+                    if entry.data_file not in self._deleted_data_files:
+                        entries_to_write.append(
                             ManifestEntry.from_args(
                                 status=ManifestEntryStatus.EXISTING,
                                 snapshot_id=entry.snapshot_id,
                                 sequence_number=entry.sequence_number,
                                 file_sequence_number=entry.file_sequence_number,
-                                data_file=entry.data_file,
+                                data_file=materialized_data_file,
                             )
                         )
-                existing_files.append(writer.to_manifest_file())
+                    if is_v3_data_manifest and row_id_cursor is not None:
+                        row_id_cursor += materialized_data_file.record_count
+
+                # We have to rewrite the manifest file without the deleted data files
+                with self.new_manifest_writer(self.spec(manifest_file.partition_spec_id)) as writer:
+                    for entry in entries_to_write:
+                        writer.add_entry(entry)
+                rewritten_manifest = writer.to_manifest_file()
+                if is_v3_data_manifest:
+                    rewritten_manifest.first_row_id = manifest_file.first_row_id
+                existing_files.append(rewritten_manifest)
 
         return existing_files
 
@@ -648,23 +739,51 @@ class _OverwriteFiles(_SnapshotProducer["_OverwriteFiles"]):
                 raise ValueError(f"Could not find the previous snapshot: {self._parent_snapshot_id}")
 
             executor = ExecutorFactory.get_or_create()
+            is_v3 = self._transaction.table_metadata.format_version >= 3
             manifest_evaluators: dict[int, Callable[[ManifestFile], bool]] = KeyDefaultDict(self._build_manifest_evaluator)
 
             def _get_entries(manifest: ManifestFile) -> list[ManifestEntry]:
                 if not manifest_evaluators[manifest.partition_spec_id](manifest):
                     return []
 
-                return [
-                    ManifestEntry.from_args(
-                        status=ManifestEntryStatus.DELETED,
-                        snapshot_id=self._snapshot_id,
-                        sequence_number=entry.sequence_number,
-                        file_sequence_number=entry.file_sequence_number,
-                        data_file=entry.data_file,
+                deleted_entries: list[ManifestEntry] = []
+                is_v3_data_manifest = is_v3 and manifest.content == ManifestContent.DATA
+                row_id_cursor: int | None = manifest.first_row_id if is_v3_data_manifest else None
+                for entry in manifest.fetch_manifest_entry(self._io, discard_deleted=True):
+                    materialized_data_file = entry.data_file
+                    is_deleted_data_file = (
+                        entry.data_file.content == DataFileContent.DATA and entry.data_file in self._deleted_data_files
                     )
-                    for entry in manifest.fetch_manifest_entry(self._io, discard_deleted=True)
-                    if entry.data_file.content == DataFileContent.DATA and entry.data_file in self._deleted_data_files
-                ]
+                    if is_v3_data_manifest:
+                        explicit_first_row_id = materialized_data_file.first_row_id
+                        if explicit_first_row_id is not None:
+                            row_id_cursor = explicit_first_row_id
+                        if is_deleted_data_file:
+                            if row_id_cursor is None:
+                                raise NotImplementedError(
+                                    "Cannot perform a v3 overwrite that preserves row lineage: the source "
+                                    "manifest is missing a first_row_id and the deleted data file "
+                                    f"{materialized_data_file.file_path} has no explicit field-142 "
+                                    "first_row_id."
+                                )
+                            if explicit_first_row_id is None:
+                                materialized_data_file = copy(materialized_data_file)
+                                materialized_data_file.first_row_id = row_id_cursor
+
+                    if is_deleted_data_file:
+                        deleted_entries.append(
+                            ManifestEntry.from_args(
+                                status=ManifestEntryStatus.DELETED,
+                                snapshot_id=self._snapshot_id,
+                                sequence_number=entry.sequence_number,
+                                file_sequence_number=entry.file_sequence_number,
+                                data_file=materialized_data_file,
+                            )
+                        )
+                    if is_v3_data_manifest and row_id_cursor is not None:
+                        row_id_cursor += materialized_data_file.record_count
+
+                return deleted_entries
 
             list_of_entries = executor.map(_get_entries, previous_snapshot.manifests(self._io))
             return list(itertools.chain(*list_of_entries))
@@ -751,9 +870,59 @@ class _ManifestMergeManager(Generic[U]):
         return groups
 
     def _create_manifest(self, spec_id: int, manifest_bin: list[ManifestFile]) -> ManifestFile:
+        format_version = self._snapshot_producer._transaction.table_metadata.format_version
+        # For v3 the merged manifest inherits min(first_row_id) and represents the contiguous
+        # range [min, min + total_rows). Reading it back assigns row ids to its DATA files in
+        # ENTRY order, so we must write entries in ascending source-manifest row-id order;
+        # otherwise inheritance would silently re-number rows. The writer emits manifests
+        # newest-first, so we sort here. DATA manifests carrying a first_row_id sort by it;
+        # any without (or delete manifests) keep a stable relative position at the front.
+        if format_version >= 3:
+            ordered_bin = sorted(
+                manifest_bin,
+                key=lambda manifest: (
+                    manifest.first_row_id
+                    if manifest.content == ManifestContent.DATA and manifest.first_row_id is not None
+                    else -1
+                ),
+            )
+        else:
+            ordered_bin = manifest_bin
+
         with self._snapshot_producer.new_manifest_writer(spec=self._snapshot_producer.spec(spec_id)) as writer:
-            for manifest in manifest_bin:
+            for manifest in ordered_bin:
+                is_v3_data_manifest = format_version >= 3 and manifest.content == ManifestContent.DATA
+                row_id_cursor: int | None = manifest.first_row_id if is_v3_data_manifest else None
                 for entry in self._snapshot_producer.fetch_manifest_entry(manifest=manifest, discard_deleted=False):
+                    if is_v3_data_manifest:
+                        materialized_data_file = entry.data_file
+                        explicit_first_row_id = materialized_data_file.first_row_id
+                        if explicit_first_row_id is not None:
+                            row_id_cursor = explicit_first_row_id
+                        carries_existing_rows = not (
+                            entry.status == ManifestEntryStatus.ADDED and entry.snapshot_id == self._snapshot_producer.snapshot_id
+                        )
+                        writes_existing_or_deleted = carries_existing_rows and (
+                            entry.status != ManifestEntryStatus.DELETED
+                            or entry.snapshot_id == self._snapshot_producer.snapshot_id
+                        )
+                        if writes_existing_or_deleted and explicit_first_row_id is None:
+                            if row_id_cursor is None:
+                                raise NotImplementedError(
+                                    "Cannot merge v3 manifests while preserving row lineage: the source "
+                                    "manifest is missing a first_row_id and data file "
+                                    f"{materialized_data_file.file_path} has no explicit field-142 "
+                                    "first_row_id."
+                                )
+                            materialized_data_file = copy(materialized_data_file)
+                            materialized_data_file.first_row_id = row_id_cursor
+                            entry = ManifestEntry.from_args(
+                                status=entry.status,
+                                snapshot_id=entry.snapshot_id,
+                                sequence_number=entry.sequence_number,
+                                file_sequence_number=entry.file_sequence_number,
+                                data_file=materialized_data_file,
+                            )
                     if entry.status == ManifestEntryStatus.DELETED and entry.snapshot_id == self._snapshot_producer.snapshot_id:
                         #  only files deleted by this snapshot should be added to the new manifest
                         writer.delete(entry)
@@ -763,21 +932,87 @@ class _ManifestMergeManager(Generic[U]):
                     elif entry.status != ManifestEntryStatus.DELETED:
                         # add all non-deleted files from the old manifest as existing files
                         writer.existing(entry)
+                    if is_v3_data_manifest and row_id_cursor is not None:
+                        row_id_cursor += entry.data_file.record_count
 
-        return writer.to_manifest_file()
+        merged_manifest = writer.to_manifest_file()
+        inherited_first_row_ids = [
+            manifest.first_row_id
+            for manifest in manifest_bin
+            if manifest.content == ManifestContent.DATA and manifest.first_row_id is not None
+        ]
+        if inherited_first_row_ids:
+            merged_manifest.first_row_id = min(inherited_first_row_ids)
+
+        return merged_manifest
+
+    def _v3_row_ids_are_contiguous(self, manifest_bin: list[ManifestFile]) -> bool:
+        """Whether the v3 DATA manifests cover a single gapless, non-overlapping row-id range.
+
+        A merged manifest inherits ``min(first_row_id)`` and, because the entries are written
+        in ascending row-id order (see ``_create_manifest``), it represents the contiguous
+        range ``[min, min + total_rows)``. That is only correct when the source manifests'
+        ranges tile that interval exactly. We therefore SORT the ranges by ``first_row_id``
+        and verify they are gapless/non-overlapping. The input order does NOT matter — the
+        writer emits manifests newest-first (descending), so requiring ascending input here
+        would (and previously did) disable v3 merging entirely.
+        """
+        assigned = [
+            manifest
+            for manifest in manifest_bin
+            if manifest.content == ManifestContent.DATA and manifest.first_row_id is not None
+        ]
+        if len(assigned) <= 1:
+            return True
+
+        sorted_assigned = sorted(assigned, key=lambda manifest: manifest.first_row_id or 0)
+
+        cursor = sorted_assigned[0].first_row_id
+        if cursor is None:
+            return False
+
+        for manifest in sorted_assigned:
+            existing_rows_count = manifest.existing_rows_count
+            added_rows_count = manifest.added_rows_count
+            if existing_rows_count is None or added_rows_count is None:
+                return False
+            if manifest.first_row_id != cursor:
+                return False
+            cursor += existing_rows_count + added_rows_count
+
+        return True
 
     def _merge_group(self, first_manifest: ManifestFile, spec_id: int, manifests: list[ManifestFile]) -> list[ManifestFile]:
         packer: ListPacker[ManifestFile] = ListPacker(target_weight=self._target_size_bytes, lookback=1, largest_bin_first=False)
         bins: list[list[ManifestFile]] = packer.pack_end(manifests, lambda m: m.manifest_length)
+        format_version = self._snapshot_producer._transaction.table_metadata.format_version
 
         def merge_bin(manifest_bin: list[ManifestFile]) -> list[ManifestFile]:
             output_manifests = []
             if len(manifest_bin) == 1:
                 output_manifests.append(manifest_bin[0])
+            elif (
+                format_version >= 3
+                and first_manifest in manifest_bin
+                and first_manifest.content == ManifestContent.DATA
+                and first_manifest.first_row_id is None
+            ):
+                remaining_manifests = [manifest for manifest in manifest_bin if manifest != first_manifest]
+                output_manifests.append(first_manifest)
+                if len(remaining_manifests) == 1:
+                    output_manifests.append(remaining_manifests[0])
+                elif len(remaining_manifests) < self._min_count_to_merge:
+                    output_manifests.extend(remaining_manifests)
+                elif not self._v3_row_ids_are_contiguous(remaining_manifests):
+                    output_manifests.extend(remaining_manifests)
+                else:
+                    output_manifests.append(self._create_manifest(spec_id, remaining_manifests))
             elif first_manifest in manifest_bin and len(manifest_bin) < self._min_count_to_merge:
                 #  if the bin has the first manifest (the new data files or an appended manifest file) then only
                 #  merge it if the number of manifests is above the minimum count. this is applied only to bins
                 #  with an in-memory manifest so that large manifests don't prevent merging older groups.
+                output_manifests.extend(manifest_bin)
+            elif format_version >= 3 and not self._v3_row_ids_are_contiguous(manifest_bin):
                 output_manifests.extend(manifest_bin)
             else:
                 output_manifests.append(self._create_manifest(spec_id, manifest_bin))
