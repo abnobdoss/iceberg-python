@@ -208,6 +208,11 @@ UTC_ALIASES = {"UTC", "+00:00", "Etc/UTC", "Z"}
 
 T = TypeVar("T")
 
+POSITIONAL_DELETE_WRITE_SCHEMA = Schema(
+    NestedField(2147483546, "file_path", StringType()),
+    NestedField(2147483545, "pos", LongType()),
+)
+
 
 @lru_cache
 def _cached_resolve_s3_region(bucket: str) -> str | None:
@@ -2683,6 +2688,81 @@ def write_file(io: FileIO, table_metadata: TableMetadata, tasks: Iterator[WriteT
     data_files = executor.map(write_parquet, tasks)
 
     return iter(data_files)
+
+
+def _write_position_delete_file(
+    io: FileIO,
+    table_metadata: TableMetadata,
+    write_uuid: uuid.UUID,
+    counter: itertools.count[int],
+    partition: Record,
+    spec_id: int,
+    delete_rows: Iterable[tuple[str, int]],
+) -> DataFile:
+    """Write one v2 position-delete Parquet file for a single partition."""
+    rows = sorted(delete_rows)
+    if not rows:
+        raise ValueError("Cannot write an empty position-delete file")
+
+    parquet_writer_kwargs = _get_parquet_writer_kwargs(table_metadata.properties)
+    row_group_size = property_as_int(
+        properties=table_metadata.properties,
+        property_name=TableProperties.PARQUET_ROW_GROUP_LIMIT,
+        default=TableProperties.PARQUET_ROW_GROUP_LIMIT_DEFAULT,
+    )
+    arrow_schema = pa.schema(
+        [
+            pa.field("file_path", pa.string(), nullable=False, metadata={PYARROW_PARQUET_FIELD_ID_KEY: b"2147483546"}),
+            pa.field("pos", pa.int64(), nullable=False, metadata={PYARROW_PARQUET_FIELD_ID_KEY: b"2147483545"}),
+        ]
+    )
+    arrow_table = pa.Table.from_arrays(
+        [
+            pa.array([file_path for file_path, _ in rows], type=pa.string()),
+            pa.array([pos for _, pos in rows], type=pa.int64()),
+        ],
+        schema=arrow_schema,
+    )
+
+    location_provider = load_location_provider(table_location=table_metadata.location, table_properties=table_metadata.properties)
+    file_path = location_provider.new_data_location(
+        data_file_name=f"00000-{next(counter)}-{write_uuid}-deletes.parquet",
+    )
+    fo = io.new_output(file_path)
+    with fo.create(overwrite=True) as fos:
+        with pq.ParquetWriter(fos, schema=arrow_table.schema, store_decimal_as_integer=True, **parquet_writer_kwargs) as writer:
+            writer.write(arrow_table, row_group_size=row_group_size)
+
+    stats_columns = compute_statistics_plan(POSITIONAL_DELETE_WRITE_SCHEMA, table_metadata.properties)
+    # The reader routes a position-delete file to a data file by its exact file_path bound, so the
+    # bound must be the full, untruncated path rather than the default truncate(16) string metric.
+    stats_columns[2147483546] = StatisticsCollector(
+        field_id=2147483546,
+        iceberg_type=StringType(),
+        mode=MetricsMode(MetricModeTypes.FULL),
+        column_name="file_path",
+    )
+    statistics = data_file_statistics_from_parquet_metadata(
+        parquet_metadata=writer.writer.metadata,
+        stats_columns=stats_columns,
+        parquet_column_mapping=parquet_path_to_id_mapping(POSITIONAL_DELETE_WRITE_SCHEMA),
+    )
+
+    data_file = DataFile.from_args(
+        _table_format_version=table_metadata.format_version,
+        content=DataFileContent.POSITION_DELETES,
+        file_path=file_path,
+        file_format=FileFormat.PARQUET,
+        partition=partition,
+        file_size_in_bytes=len(fo),
+        sort_order_id=None,
+        spec_id=spec_id,
+        equality_ids=None,
+        key_metadata=None,
+        **statistics.to_serialized_dict(),
+    )
+    data_file.spec_id = spec_id
+    return data_file
 
 
 def bin_pack_arrow_table(tbl: pa.Table, target_file_size: int) -> Iterator[list[pa.RecordBatch]]:

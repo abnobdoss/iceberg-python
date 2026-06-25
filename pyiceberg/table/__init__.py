@@ -716,14 +716,22 @@ class Transaction:
         """
         from pyiceberg.io.pyarrow import ArrowScan, _dataframe_to_data_files, _expression_to_complementary_pyarrow
 
+        if isinstance(delete_filter, str):
+            delete_filter = _parse_row_filter(delete_filter)
+
         if (
             self.table_metadata.properties.get(TableProperties.DELETE_MODE, TableProperties.DELETE_MODE_DEFAULT)
             == TableProperties.DELETE_MODE_MERGE_ON_READ
         ):
+            if self.table_metadata.format_version == 2:
+                self._delete_merge_on_read_position_deletes(
+                    delete_filter=delete_filter,
+                    snapshot_properties=snapshot_properties,
+                    case_sensitive=case_sensitive,
+                    branch=branch,
+                )
+                return
             warnings.warn("Merge on read is not yet supported, falling back to copy-on-write", stacklevel=2)
-
-        if isinstance(delete_filter, str):
-            delete_filter = _parse_row_filter(delete_filter)
 
         with self.update_snapshot(snapshot_properties=snapshot_properties, branch=branch).delete() as delete_snapshot:
             delete_snapshot.delete_by_predicate(delete_filter, case_sensitive)
@@ -789,6 +797,80 @@ class Transaction:
 
         if not delete_snapshot.files_affected and not delete_snapshot.rewrites_needed:
             warnings.warn("Delete operation did not match any records", stacklevel=2)
+
+    def _delete_merge_on_read_position_deletes(
+        self,
+        delete_filter: BooleanExpression,
+        snapshot_properties: dict[str, str] = EMPTY_DICT,
+        case_sensitive: bool = True,
+        branch: str | None = MAIN_BRANCH,
+    ) -> None:
+        import pyarrow as pa
+
+        from pyiceberg.io.pyarrow import (
+            ArrowScan,
+            _read_all_delete_files,
+            _write_position_delete_file,
+            expression_to_pyarrow,
+        )
+
+        file_scan = self._scan(row_filter=delete_filter, case_sensitive=case_sensitive)
+        if branch is not None:
+            file_scan = file_scan.use_ref(branch)
+        tasks = list(file_scan.plan_files())
+
+        bound_delete_filter = bind(self.table_metadata.schema(), delete_filter, case_sensitive)
+        pyarrow_filter = expression_to_pyarrow(bound_delete_filter, self.table_metadata.schema())
+        deletes_per_file = _read_all_delete_files(self._table.io, tasks)
+        delete_rows_by_partition: dict[tuple[int, Record], list[tuple[str, int]]] = {}
+
+        raw_scan = ArrowScan(
+            table_metadata=self.table_metadata,
+            io=self._table.io,
+            projected_schema=self.table_metadata.schema(),
+            row_filter=AlwaysTrue(),
+            case_sensitive=case_sensitive,
+        )
+
+        for task in tasks:
+            existing_deleted_positions: set[int] = set()
+            for positions in deletes_per_file.get(task.file.file_path, []):
+                existing_deleted_positions.update(int(pos) for pos in positions.to_pylist())
+
+            current_index = 0
+            raw_task = FileScanTask(task.file, delete_files=set(), residual=AlwaysTrue())
+            for batch in raw_scan.to_record_batches([raw_task]):
+                row_positions = pa.array(range(current_index, current_index + batch.num_rows), type=pa.int64())
+                current_index += batch.num_rows
+
+                batch_with_positions = pa.Table.from_batches([batch]).append_column("__pyiceberg_position", row_positions)
+                matching_positions = batch_with_positions.filter(pyarrow_filter).column("__pyiceberg_position").to_pylist()
+                rows_to_delete = [
+                    (task.file.file_path, pos) for pos in matching_positions if pos not in existing_deleted_positions
+                ]
+
+                if rows_to_delete:
+                    key = (task.file.spec_id, task.file.partition)
+                    delete_rows_by_partition.setdefault(key, []).extend(rows_to_delete)
+
+        if not delete_rows_by_partition:
+            warnings.warn("Delete operation did not match any records", stacklevel=2)
+            return
+
+        with self.update_snapshot(snapshot_properties=snapshot_properties, branch=branch).delete() as delete_snapshot:
+            counter = itertools.count(0)
+            for (spec_id, partition), delete_rows in delete_rows_by_partition.items():
+                delete_snapshot.append_delete_file(
+                    _write_position_delete_file(
+                        io=self._table.io,
+                        table_metadata=self.table_metadata,
+                        write_uuid=delete_snapshot.commit_uuid,
+                        counter=counter,
+                        partition=partition,
+                        spec_id=spec_id,
+                        delete_rows=delete_rows,
+                    )
+                )
 
     def upsert(
         self,
