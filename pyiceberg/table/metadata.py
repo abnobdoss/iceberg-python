@@ -28,6 +28,7 @@ from pydantic import ValidationError as PydanticValidationError
 from pyiceberg.exceptions import ValidationError
 from pyiceberg.partitioning import PARTITION_FIELD_ID_START, PartitionSpec, assign_fresh_partition_spec_ids
 from pyiceberg.schema import Schema, assign_fresh_schema_ids
+from pyiceberg.table.encryption import EncryptedKey
 from pyiceberg.table.name_mapping import NameMapping, parse_mapping_from_json
 from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef, SnapshotRefType
 from pyiceberg.table.snapshots import MetadataLogEntry, Snapshot, SnapshotLogEntry
@@ -573,6 +574,9 @@ class TableMetadataV3(TableMetadataCommonFields, IcebergBaseModel):
 
     next_row_id: int | None = Field(alias="next-row-id", default=None)
     """A long higher than all assigned row IDs; the next snapshot's `first-row-id`."""
+
+    encryption_keys: list[EncryptedKey] | None = Field(alias="encryption-keys", default=None)
+    """A list of encrypted keys used by this table."""
 
     def model_dump_json(self, exclude_none: bool = True, exclude: Any | None = None, by_alias: bool = True, **kwargs: Any) -> str:
         raise NotImplementedError("Writing V3 is not yet supported, see: https://github.com/apache/iceberg-python/issues/1551")
