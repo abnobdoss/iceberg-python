@@ -22,7 +22,9 @@ from uuid import uuid4
 import pytest
 
 from pyiceberg.table import CommitTableResponse, Table
-from pyiceberg.table.update import RemoveSnapshotsUpdate, update_table_metadata
+from pyiceberg.table.refs import SnapshotRef, SnapshotRefType
+from pyiceberg.table.snapshots import SnapshotLogEntry
+from pyiceberg.table.update import RemoveSnapshotsUpdate, TableRequirement, TableUpdate, update_table_metadata
 from pyiceberg.table.update.snapshot import ExpireSnapshots
 
 
@@ -71,6 +73,29 @@ def test_cannot_expire_tagged_snapshot(table_v2: Table) -> None:
 
     with pytest.raises(ValueError, match=f"Snapshot with ID {TAGGED_SNAPSHOT} is protected and cannot be expired."):
         table_v2.maintenance.expire_snapshots().by_id(TAGGED_SNAPSHOT).commit()
+
+    table_v2.catalog.commit_table.assert_not_called()
+
+
+def test_cannot_expire_current_snapshot_without_ref(table_v2: Table) -> None:
+    current_snapshot_id = table_v2.metadata.current_snapshot_id
+    assert current_snapshot_id is not None
+    non_current_snapshot_id = next(
+        snapshot.snapshot_id for snapshot in table_v2.metadata.snapshots if snapshot.snapshot_id != current_snapshot_id
+    )
+
+    table_v2.catalog = MagicMock()
+    table_v2.metadata = table_v2.metadata.model_copy(
+        update={
+            "refs": {
+                "main": SnapshotRef(snapshot_id=non_current_snapshot_id, snapshot_ref_type=SnapshotRefType.BRANCH),
+            }
+        }
+    )
+    assert all(ref.snapshot_id != current_snapshot_id for ref in table_v2.metadata.refs.values())
+
+    with pytest.raises(ValueError, match=f"Snapshot with ID {current_snapshot_id} is protected and cannot be expired."):
+        table_v2.maintenance.expire_snapshots().by_id(current_snapshot_id).commit()
 
     table_v2.catalog.commit_table.assert_not_called()
 
@@ -316,3 +341,241 @@ def test_update_remove_snapshots_with_statistics(table_v2_with_statistics: Table
     assert not any(stat.snapshot_id == REMOVE_SNAPSHOT for stat in new_metadata.statistics), (
         "Statistics for removed snapshot should be gone"
     )
+
+
+def _prepare_table_with_snapshots(
+    table: Table,
+    snapshot_ids_and_timestamps: list[tuple[int, int]],
+    refs: dict[str, SnapshotRef] | None = None,
+    current_snapshot_id: int | None = None,
+) -> None:
+    base_snapshot = table.metadata.snapshots[0]
+    snapshots = []
+    snapshot_log = []
+    parent_snapshot_id = None
+
+    for sequence_number, (snapshot_id, timestamp_ms) in enumerate(snapshot_ids_and_timestamps):
+        snapshots.append(
+            base_snapshot.model_copy(
+                update={
+                    "snapshot_id": snapshot_id,
+                    "parent_snapshot_id": parent_snapshot_id,
+                    "sequence_number": sequence_number,
+                    "timestamp_ms": timestamp_ms,
+                    "manifest_list": f"s3://bucket/test/{snapshot_id}.avro",
+                }
+            )
+        )
+        snapshot_log.append(SnapshotLogEntry(snapshot_id=snapshot_id, timestamp_ms=timestamp_ms))
+        parent_snapshot_id = snapshot_id
+
+    table.metadata = table.metadata.model_copy(
+        update={
+            "current_snapshot_id": current_snapshot_id,
+            "refs": refs or {},
+            "snapshots": snapshots,
+            "snapshot_log": snapshot_log,
+        }
+    )
+
+
+def _configure_commit_to_apply_updates(table: Table) -> None:
+    def commit_table(
+        _table: Table, _requirements: tuple[TableRequirement, ...], updates: tuple[TableUpdate, ...]
+    ) -> CommitTableResponse:
+        return CommitTableResponse(
+            metadata=update_table_metadata(table.metadata, updates),
+            metadata_location="mock://metadata/location",
+            uuid=uuid4(),
+        )
+
+    table.catalog = MagicMock()
+    table.catalog.commit_table.side_effect = commit_table
+
+
+def test_retain_last_two_expires_surplus_unprotected_snapshots(table_v2: Table) -> None:
+    _prepare_table_with_snapshots(
+        table_v2,
+        [
+            (101, 1000),
+            (102, 2000),
+            (103, 3000),
+            (104, 4000),
+            (105, 5000),
+        ],
+    )
+    _configure_commit_to_apply_updates(table_v2)
+
+    table_v2.maintenance.expire_snapshots().retain_last(2).commit()
+
+    remaining_ids = {snapshot.snapshot_id for snapshot in table_v2.metadata.snapshots}
+    assert remaining_ids == {104, 105}
+
+
+def test_retain_last_one_keeps_only_newest_unprotected_snapshot(table_v2: Table) -> None:
+    _prepare_table_with_snapshots(
+        table_v2,
+        [
+            (101, 1000),
+            (102, 2000),
+            (103, 3000),
+        ],
+    )
+    _configure_commit_to_apply_updates(table_v2)
+
+    table_v2.maintenance.expire_snapshots().retain_last(1).commit()
+
+    remaining_ids = {snapshot.snapshot_id for snapshot in table_v2.metadata.snapshots}
+    assert remaining_ids == {103}
+
+
+def test_retain_last_keeps_current_snapshot_without_counting_it(table_v2: Table) -> None:
+    _prepare_table_with_snapshots(
+        table_v2,
+        [
+            (101, 1000),
+            (102, 2000),
+            (103, 3000),
+            (104, 4000),
+        ],
+        refs={
+            "main": SnapshotRef(snapshot_id=104, snapshot_ref_type=SnapshotRefType.BRANCH),
+        },
+        current_snapshot_id=101,
+    )
+    _configure_commit_to_apply_updates(table_v2)
+    assert all(ref.snapshot_id != 101 for ref in table_v2.metadata.refs.values())
+
+    table_v2.maintenance.expire_snapshots().retain_last(1).commit()
+
+    remaining_ids = {snapshot.snapshot_id for snapshot in table_v2.metadata.snapshots}
+    assert remaining_ids == {101, 103, 104}
+    assert table_v2.metadata.current_snapshot_id == 101
+    current_snapshot = table_v2.current_snapshot()
+    assert current_snapshot is not None
+    assert current_snapshot.snapshot_id == 101
+
+
+def test_older_than_with_retain_last_keeps_newest_unprotected_floor(table_v2: Table) -> None:
+    _prepare_table_with_snapshots(
+        table_v2,
+        [
+            (101, 1000),
+            (102, 2000),
+            (103, 3000),
+            (104, 4000),
+            (105, 5000),
+        ],
+    )
+    _configure_commit_to_apply_updates(table_v2)
+
+    table_v2.maintenance.expire_snapshots().older_than(datetime(1970, 1, 1, 0, 0, 10)).retain_last(2).commit()
+
+    remaining_ids = {snapshot.snapshot_id for snapshot in table_v2.metadata.snapshots}
+    assert remaining_ids == {104, 105}
+
+
+def test_older_than_with_retain_last_intersection(table_v2: Table) -> None:
+    _prepare_table_with_snapshots(
+        table_v2,
+        [
+            (101, 1000),
+            (102, 2000),
+            (103, 3000),
+            (104, 4000),
+            (105, 5000),
+        ],
+    )
+    _configure_commit_to_apply_updates(table_v2)
+
+    table_v2.maintenance.expire_snapshots().older_than(datetime(1970, 1, 1, 0, 0, 2, 500000)).retain_last(2).commit()
+
+    remaining_ids = {snapshot.snapshot_id for snapshot in table_v2.metadata.snapshots}
+    assert remaining_ids == {103, 104, 105}
+
+
+def test_older_than_matching_nothing_with_retain_last_expires_nothing(table_v2: Table) -> None:
+    _prepare_table_with_snapshots(
+        table_v2,
+        [
+            (101, 1000),
+            (102, 2000),
+            (103, 3000),
+            (104, 4000),
+            (105, 5000),
+        ],
+    )
+    _configure_commit_to_apply_updates(table_v2)
+
+    # Cutoff before the oldest snapshot: older_than selects nothing, so retain_last must act
+    # only as a floor and expire nothing (it must NOT fall back to standalone behavior).
+    table_v2.maintenance.expire_snapshots().older_than(datetime(1970, 1, 1, 0, 0, 0, 500000)).retain_last(2).commit()
+
+    remaining_ids = {snapshot.snapshot_id for snapshot in table_v2.metadata.snapshots}
+    assert remaining_ids == {101, 102, 103, 104, 105}
+
+
+def test_empty_by_ids_with_retain_last_expires_nothing(table_v2: Table) -> None:
+    _prepare_table_with_snapshots(
+        table_v2,
+        [
+            (101, 1000),
+            (102, 2000),
+            (103, 3000),
+        ],
+    )
+    _configure_commit_to_apply_updates(table_v2)
+
+    # An explicit (if empty) by_ids selector means retain_last acts only as a floor, not standalone.
+    table_v2.maintenance.expire_snapshots().by_ids([]).retain_last(1).commit()
+
+    remaining_ids = {snapshot.snapshot_id for snapshot in table_v2.metadata.snapshots}
+    assert remaining_ids == {101, 102, 103}
+
+
+def test_retain_last_tiebreak_uses_sequence_number(table_v2: Table) -> None:
+    _prepare_table_with_snapshots(
+        table_v2,
+        [
+            (102, 1000),
+            (101, 1000),
+        ],
+    )
+    _configure_commit_to_apply_updates(table_v2)
+
+    table_v2.maintenance.expire_snapshots().retain_last(1).commit()
+
+    remaining_ids = {snapshot.snapshot_id for snapshot in table_v2.metadata.snapshots}
+    assert remaining_ids == {101}
+
+
+def test_retain_last_keeps_protected_snapshots_without_counting_them(table_v2: Table) -> None:
+    _prepare_table_with_snapshots(
+        table_v2,
+        [
+            (101, 1000),
+            (102, 2000),
+            (103, 3000),
+            (104, 4000),
+        ],
+        refs={
+            "old-tag": SnapshotRef(snapshot_id=101, snapshot_ref_type=SnapshotRefType.TAG),
+            "main": SnapshotRef(snapshot_id=104, snapshot_ref_type=SnapshotRefType.BRANCH),
+        },
+        current_snapshot_id=104,
+    )
+    _configure_commit_to_apply_updates(table_v2)
+
+    table_v2.maintenance.expire_snapshots().retain_last(1).commit()
+
+    remaining_ids = {snapshot.snapshot_id for snapshot in table_v2.metadata.snapshots}
+    assert remaining_ids == {101, 103, 104}
+
+
+def test_retain_last_requires_at_least_one_snapshot(table_v2: Table) -> None:
+    table_v2.catalog = MagicMock()
+
+    with pytest.raises(ValueError, match="Number of snapshots to retain must be at least 1"):
+        table_v2.maintenance.expire_snapshots().retain_last(0)
+
+    table_v2.catalog.commit_table.assert_not_called()

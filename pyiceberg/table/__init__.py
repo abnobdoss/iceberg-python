@@ -50,7 +50,7 @@ from pyiceberg.table.locations import LocationProvider, load_location_provider
 from pyiceberg.table.maintenance import MaintenanceTable
 from pyiceberg.table.metadata import INITIAL_SEQUENCE_NUMBER, TableMetadata
 from pyiceberg.table.name_mapping import NameMapping
-from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef
+from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef, SnapshotRefType
 from pyiceberg.table.snapshots import Snapshot, SnapshotLogEntry
 from pyiceberg.table.sorting import UNSORTED_SORT_ORDER, SortOrder
 from pyiceberg.table.update import (
@@ -1219,6 +1219,9 @@ class Table:
         snapshot_id: int | None = None,
         options: Properties = EMPTY_DICT,
         limit: int | None = None,
+        *,
+        branch: str | None = None,
+        tag: str | None = None,
     ) -> DataScan:
         """Fetch a DataScan based on the table's current metadata.
 
@@ -1245,10 +1248,24 @@ class Table:
                 An integer representing the number of rows to
                 return in the scan result. If None, fetches all
                 matching rows.
+            branch:
+                Optional branch name to scan. If provided, the branch
+                is resolved to its referenced snapshot ID.
+            tag:
+                Optional tag name to scan. If provided, the tag is
+                resolved to its referenced snapshot ID.
 
         Returns:
             A DataScan based on the table's current metadata.
         """
+        if sum(ref is not None for ref in (snapshot_id, branch, tag)) > 1:
+            raise ValueError("Cannot specify more than one of snapshot_id, branch, and tag")
+
+        if branch is not None:
+            snapshot_id = self._scan_ref_snapshot_id(branch, SnapshotRefType.BRANCH)
+        elif tag is not None:
+            snapshot_id = self._scan_ref_snapshot_id(tag, SnapshotRefType.TAG)
+
         return DataScan(
             table_metadata=self.metadata,
             io=self.io,
@@ -1261,6 +1278,18 @@ class Table:
             catalog=self.catalog,
             table_identifier=self._identifier,
         )
+
+    def _scan_ref_snapshot_id(self, name: str, snapshot_ref_type: SnapshotRefType) -> int:
+        ref_type_name = snapshot_ref_type.value
+        ref = self.metadata.refs.get(name)
+        if ref is None:
+            raise ValueError(f"Cannot scan unknown {ref_type_name}={name}")
+        if ref.snapshot_ref_type != snapshot_ref_type:
+            raise ValueError(f"Ref {name} is not a {ref_type_name}")
+        if snapshot := self.metadata.snapshot_by_name(name):
+            return snapshot.snapshot_id
+
+        raise ValueError(f"Cannot scan unknown {ref_type_name}={name}")
 
     @property
     def format_version(self) -> TableVersion:
@@ -1775,6 +1804,9 @@ class StagedTable(Table):
         snapshot_id: int | None = None,
         options: Properties = EMPTY_DICT,
         limit: int | None = None,
+        *,
+        branch: str | None = None,
+        tag: str | None = None,
     ) -> DataScan:
         raise ValueError("Cannot scan a staged table")
 
