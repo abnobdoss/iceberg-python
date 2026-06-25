@@ -293,6 +293,7 @@ def test_position_delete_sequence_number_does_not_affect_later_appends(catalog: 
     data_file = _append_initial_rows(table)
     first_snapshot = table.current_snapshot()
     assert first_snapshot is not None
+    assert first_snapshot.sequence_number is not None
     first_sequence_number = first_snapshot.sequence_number
     assert first_sequence_number is not None
 
