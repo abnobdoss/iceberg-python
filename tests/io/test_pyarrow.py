@@ -5297,3 +5297,76 @@ def test_dictionary_columns_produces_dict_encoded_output(tmpdir: str) -> None:
 
     # Values must be identical
     assert result_plain.column("label").to_pylist() == result_dict.column("label").to_pylist()
+
+
+@pytest.fixture
+def sql_catalog(tmp_path: Path) -> Iterator[Any]:
+    from pyiceberg.catalog.sql import SqlCatalog
+
+    catalog = SqlCatalog(
+        "test_sql_catalog",
+        uri="sqlite:///:memory:",
+        warehouse=f"file://{tmp_path}",
+    )
+    catalog.create_tables()
+    try:
+        yield catalog
+    finally:
+        catalog.destroy_tables()
+        catalog.close()
+
+
+def _create_dictionary_batch_reader_table(catalog: Any, identifier: str) -> Any:
+    arrow_table = pa.table(
+        {
+            "id": pa.array([1, 2, 3, 4], type=pa.int64()),
+            "label": pa.array(["a", "b", "a", "b"], type=pa.string()),
+        }
+    )
+    catalog.create_namespace_if_not_exists("default")
+    table = catalog.create_table(identifier, schema=arrow_table.schema)
+    table.append(arrow_table)
+    return table
+
+
+def test_to_arrow_batch_reader_preserves_dictionary_columns(sql_catalog: Any) -> None:
+    """Regression test for issue #3540.
+
+    ``to_arrow(dictionary_columns=...)`` preserves dictionary encoding, but
+    ``to_arrow_batch_reader(dictionary_columns=...)`` previously decoded it back
+    to plain strings via a final ``.cast(target_schema)`` where ``target_schema``
+    had no dictionary types. Both public paths must now preserve the encoding.
+    """
+    table = _create_dictionary_batch_reader_table(sql_catalog, "default.dict_batch_reader_test")
+    expected = table.scan().to_arrow(dictionary_columns=("label",))
+    result = table.scan().to_arrow_batch_reader(dictionary_columns=("label",)).read_all()
+
+    assert result.schema.field("label").type == expected.schema.field("label").type
+    assert pa.types.is_dictionary(result.schema.field("label").type)
+    assert result.column("label").to_pylist() == ["a", "b", "a", "b"]
+    assert result.to_pydict() == expected.to_pydict()
+    # A column not in dictionary_columns stays a plain (non-dict) array.
+    assert result.schema.field("id").type == expected.schema.field("id").type == pa.int64()
+    assert not pa.types.is_dictionary(result.schema.field("id").type)
+
+
+def test_to_arrow_batch_reader_dictionary_columns_keep_non_string_columns_plain(sql_catalog: Any) -> None:
+    table = _create_dictionary_batch_reader_table(sql_catalog, "default.dict_int_batch_reader_test")
+    expected = table.scan().to_arrow(dictionary_columns=("id",))
+    result = table.scan().to_arrow_batch_reader(dictionary_columns=("id",)).read_all()
+
+    assert result.schema.field("id").type == expected.schema.field("id").type == pa.int64()
+    assert not pa.types.is_dictionary(result.schema.field("id").type)
+    assert result.to_pydict() == expected.to_pydict()
+
+
+def test_to_arrow_batch_reader_dictionary_columns_allow_mixed_types(sql_catalog: Any) -> None:
+    table = _create_dictionary_batch_reader_table(sql_catalog, "default.dict_mixed_batch_reader_test")
+    expected = table.scan().to_arrow(dictionary_columns=("label", "id"))
+    result = table.scan().to_arrow_batch_reader(dictionary_columns=("label", "id")).read_all()
+
+    assert result.schema.field("label").type == expected.schema.field("label").type
+    assert pa.types.is_dictionary(result.schema.field("label").type)
+    assert result.schema.field("id").type == expected.schema.field("id").type == pa.int64()
+    assert not pa.types.is_dictionary(result.schema.field("id").type)
+    assert result.to_pydict() == expected.to_pydict()

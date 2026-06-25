@@ -2219,7 +2219,6 @@ class DataScan(TableScan):
 
         from pyiceberg.io.pyarrow import ArrowScan, schema_to_pyarrow
 
-        target_schema = schema_to_pyarrow(self.projection())
         batches = ArrowScan(
             self.table_metadata,
             self.io,
@@ -2229,6 +2228,23 @@ class DataScan(TableScan):
             self.limit,
             dictionary_columns=dictionary_columns,
         ).to_record_batches(self.plan_files())
+
+        target_schema = schema_to_pyarrow(self.projection())
+        if dictionary_columns:
+            batches = iter(batches)
+            try:
+                first_batch = next(batches)
+            except StopIteration:
+                pass
+            else:
+                target_schema = pa.schema(
+                    [
+                        field.with_type(batch_field.type)
+                        for field, batch_field in zip(target_schema, first_batch.schema, strict=True)
+                    ],
+                    metadata=target_schema.metadata,
+                )
+                batches = chain([first_batch], batches)
 
         return pa.RecordBatchReader.from_batches(
             target_schema,
