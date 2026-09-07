@@ -14,6 +14,10 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+import subprocess
+import sys
+import textwrap
+from datetime import datetime
 from pathlib import PosixPath
 
 import pyarrow as pa
@@ -23,14 +27,26 @@ from pyarrow import Table as pa_table
 
 from pyiceberg.catalog import Catalog
 from pyiceberg.exceptions import NoSuchTableError
-from pyiceberg.expressions import AlwaysTrue, And, EqualTo, Reference
+from pyiceberg.expressions import (
+    AlwaysFalse,
+    AlwaysTrue,
+    And,
+    EqualTo,
+    GreaterThanOrEqual,
+    IsNull,
+    LessThanOrEqual,
+    Or,
+    Reference,
+)
 from pyiceberg.expressions.literals import LongLiteral
 from pyiceberg.io.pyarrow import schema_to_pyarrow
+from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.table import Table, UpsertResult
 from pyiceberg.table.snapshots import Operation
-from pyiceberg.table.upsert_util import create_match_filter
-from pyiceberg.types import IntegerType, NestedField, StringType, StructType
+from pyiceberg.table.upsert_util import create_file_match_filter, create_match_filter
+from pyiceberg.transforms import DayTransform
+from pyiceberg.types import IntegerType, NestedField, StringType, StructType, TimestampType
 from tests.catalog.test_base import InMemoryCatalog
 
 
@@ -443,6 +459,138 @@ def test_create_match_filter_single_condition() -> None:
     )
 
 
+def test_create_file_match_filter_empty_source_prunes_everything() -> None:
+    table = pa.table({"order_id": pa.array([], type=pa.int64()), "order_line_id": pa.array([], type=pa.int64())})
+
+    assert create_file_match_filter(table, ["order_id", "order_line_id"]) == AlwaysFalse()
+
+
+def test_create_file_match_filter_multi_column_bounds() -> None:
+    table = pa.table({"order_id": [1, 2, 3], "order_line_id": [100, 200, 300]})
+
+    expr = create_file_match_filter(table, ["order_id", "order_line_id"])
+
+    leaves: list[object] = []
+
+    def collect(node: object) -> None:
+        if isinstance(node, And):
+            collect(node.left)
+            collect(node.right)
+        else:
+            leaves.append(node)
+
+    collect(expr)
+    bounds_by_col: dict[str, dict[type, object]] = {}
+    for leaf in leaves:
+        bounds_by_col.setdefault(leaf.term.name, {})[type(leaf)] = leaf.literal.value  # type: ignore[attr-defined]
+
+    assert bounds_by_col == {
+        "order_id": {GreaterThanOrEqual: 1, LessThanOrEqual: 3},
+        "order_line_id": {GreaterThanOrEqual: 100, LessThanOrEqual: 300},
+    }
+
+
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        ([1, 5], And(GreaterThanOrEqual("order_id", 1), LessThanOrEqual("order_id", 5))),
+        ([None, None], IsNull("order_id")),
+        ([1, None, 5], Or(And(GreaterThanOrEqual("order_id", 1), LessThanOrEqual("order_id", 5)), IsNull("order_id"))),
+    ],
+)
+def test_create_file_match_filter_null_shape(values: list[int | None], expected: object) -> None:
+    table = pa.table({"order_id": pa.array(values, type=pa.int64())})
+
+    assert create_file_match_filter(table, ["order_id"]) == expected
+
+
+def test_upsert_multi_col_file_match_filter_culls_false_positives(catalog: Catalog) -> None:
+    identifier = "default.test_upsert_multi_col_file_match_filter_culls_false_positives"
+    _drop_table(catalog, identifier)
+
+    schema = pa.schema([("order_id", pa.int32()), ("order_line_id", pa.int32()), ("payload", pa.string())])
+    table = catalog.create_table(identifier, schema)
+    table.append(
+        pa.Table.from_pylist(
+            [
+                {"order_id": 1, "order_line_id": 200, "payload": "keep-1"},
+                {"order_id": 2, "order_line_id": 100, "payload": "keep-2"},
+                {"order_id": 1, "order_line_id": 100, "payload": "old"},
+            ],
+            schema=schema,
+        )
+    )
+
+    source = pa.Table.from_pylist(
+        [
+            {"order_id": 1, "order_line_id": 100, "payload": "new"},
+            {"order_id": 2, "order_line_id": 200, "payload": "insert"},
+        ],
+        schema=schema,
+    )
+
+    result = table.upsert(source, join_cols=["order_id", "order_line_id"])
+
+    assert result.rows_updated == 1
+    assert result.rows_inserted == 1
+    rows_by_key = {(row["order_id"], row["order_line_id"]): row["payload"] for row in table.scan().to_arrow().to_pylist()}
+    assert rows_by_key == {
+        (1, 200): "keep-1",
+        (2, 100): "keep-2",
+        (1, 100): "new",
+        (2, 200): "insert",
+    }
+
+
+def test_upsert_large_composite_key_initial_scan_does_not_recurse(tmp_path: PosixPath) -> None:
+    """Regression: initial scan planning must not build the exact composite-key tree.
+
+    Running this in a subprocess keeps the test runner alive on runtimes where the
+    old recursive visitor shape can overflow the C stack.
+    """
+    script = textwrap.dedent(
+        f"""
+        import sys
+
+        sys.setrecursionlimit(10**7)
+
+        import pyarrow as pa
+
+        from tests.catalog.test_base import InMemoryCatalog
+
+        n = 30_000
+        catalog = InMemoryCatalog("test", warehouse={str(tmp_path)!r})
+        catalog.create_namespace("default")
+        schema = pa.schema([
+            ("order_id", pa.int64()),
+            ("order_line_id", pa.int64()),
+            ("payload", pa.string()),
+        ])
+        table = catalog.create_table("default.regression", schema)
+        table.append(
+            pa.Table.from_pylist(
+                [{{"order_id": 0, "order_line_id": 100_000, "payload": "old"}}],
+                schema=schema,
+            )
+        )
+        source = pa.table({{
+            "order_id": pa.array(range(n), type=pa.int64()),
+            "order_line_id": pa.array(range(100_000, 100_000 + n), type=pa.int64()),
+            "payload": pa.array(["old"] * n, type=pa.string()),
+        }})
+
+        table.upsert(
+            source,
+            join_cols=["order_id", "order_line_id"],
+            when_not_matched_insert_all=False,
+        )
+        """
+    )
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=False)
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+
 def test_upsert_with_duplicate_rows_in_table(catalog: Catalog) -> None:
     identifier = "default.test_upsert_with_duplicate_rows_in_table"
 
@@ -712,6 +860,42 @@ def test_upsert_with_nulls(catalog: Catalog) -> None:
         ],
         schema=schema,
     )
+
+
+def test_upsert_on_table_partitioned_by_transform(catalog: Catalog) -> None:
+    """Upsert has to rewrite the matched file on a table partitioned by a non-identity transform.
+
+    The manifest pruning in the overwrite builds its predicate from the partition records of
+    the deleted files. Those records hold already-transformed values, so referencing the source
+    column would send them through the transform twice, prune away the only relevant manifest
+    and leave the replaced row behind as a duplicate.
+    """
+    identifier = "default.test_upsert_on_table_partitioned_by_transform"
+    _drop_table(catalog, identifier)
+
+    schema = Schema(
+        NestedField(1, "k", StringType(), required=False),
+        NestedField(2, "v", IntegerType(), required=False),
+        NestedField(3, "ts", TimestampType(), required=False),
+    )
+    spec = PartitionSpec(PartitionField(source_id=3, field_id=1000, transform=DayTransform(), name="ts_day"))
+    table = catalog.create_table(identifier, schema, partition_spec=spec)
+
+    arrow_schema = schema_to_pyarrow(schema)
+    # A timestamp whose day ordinal is far from the value it would be read as if the
+    # DayTransform were applied a second time.
+    ts = datetime(2026, 1, 6, 12)
+
+    def rows(pairs: list[tuple[str, int]]) -> pa_table:
+        return pa.Table.from_pylist([{"k": k, "v": v, "ts": ts} for k, v in pairs], schema=arrow_schema)
+
+    table.append(rows([("a", 1), ("b", 1)]))
+
+    res = table.upsert(rows([("a", 2)]), join_cols=["k"])
+    assert_upsert_result(res, expected_updated=1, expected_inserted=0)
+
+    arrow = table.scan().to_arrow()
+    assert sorted(zip(arrow["k"].to_pylist(), arrow["v"].to_pylist(), strict=True)) == [("a", 2), ("b", 1)]
 
 
 def test_transaction(catalog: Catalog) -> None:
