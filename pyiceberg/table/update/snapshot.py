@@ -762,6 +762,20 @@ class _RowDeltaFiles(_SnapshotProducer["_RowDeltaFiles"]):
         self._added_delete_files.append(delete_file)
         return self
 
+    def _validate_concurrency(self) -> None:
+        """Refuse to rebase onto concurrent commits; a row delta is only valid against the snapshot it was planned on.
+
+        Its position deletes name specific data files and its appended rows were matched against
+        one scan. The stock validation only looks for concurrently added data files, so a REPLACE
+        that rewrote the referenced files would pass and the rebased deletes would name dead paths,
+        resurrecting every deleted row. The caller must re-plan against the current snapshot.
+        """
+        if self._commit_window is None or self._commit_window.is_empty():
+            return
+        raise ValidationException(
+            "Row delta was planned against a snapshot that has since moved; re-plan against the current snapshot"
+        )
+
     def _existing_manifests(self) -> list[ManifestFile]:
         """Carry forward all existing manifests from the parent snapshot, like _FastAppendFiles."""
         existing_manifests = []

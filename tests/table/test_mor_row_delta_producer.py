@@ -26,12 +26,14 @@ import pytest
 
 from pyiceberg.catalog import Catalog
 from pyiceberg.conversions import from_bytes, to_bytes
-from pyiceberg.exceptions import NamespaceAlreadyExistsError
-from pyiceberg.io.pyarrow import PYARROW_PARQUET_FIELD_ID_KEY, write_position_delete_file
+from pyiceberg.exceptions import NamespaceAlreadyExistsError, ValidationException
+from pyiceberg.io.pyarrow import PYARROW_PARQUET_FIELD_ID_KEY, _dataframe_to_data_files, write_position_delete_file
 from pyiceberg.manifest import DataFile, DataFileContent, ManifestContent, ManifestFile
 from pyiceberg.schema import Schema
 from pyiceberg.table import Table
-from pyiceberg.table.snapshots import Operation
+from pyiceberg.table.snapshots import Operation, Summary
+from pyiceberg.table.update.snapshot import _OverwriteFiles
+from pyiceberg.typedef import EMPTY_DICT
 from pyiceberg.types import LongType, NestedField, StringType
 
 ICEBERG_SCHEMA = Schema(
@@ -353,3 +355,58 @@ def test_row_delta_targets_only_referenced_file_among_many_in_one_partition(cata
     # id=1 (file_one pos 0) gone; id=3 (file_two pos 0) MUST survive.
     assert _rows(table) == [{"id": 2, "data": "b"}, {"id": 3, "data": "c"}, {"id": 4, "data": "d"}]
     assert {df.file_path for df in _current_data_files(table)} == before_data_paths
+
+
+class _FakeRewriteFiles(_OverwriteFiles):
+    """Commits the REPLACE snapshot an external rewrite_data_files (compaction) job produces.
+
+    The stock summary builder only accepts APPEND, OVERWRITE and DELETE, so the summary is
+    built as an OVERWRITE and relabelled.
+    """
+
+    def _summary(self, snapshot_properties: dict[str, str] = EMPTY_DICT) -> Summary:
+        summary = super()._summary(snapshot_properties)
+        return Summary(operation=Operation.REPLACE, **summary.additional_properties)
+
+
+def _rewrite_data_file(table: Table, data_file: DataFile) -> None:
+    rewritten = table.scan().to_arrow()
+    tx = table.transaction()
+    new_files = list(_dataframe_to_data_files(table_metadata=tx.table_metadata, df=rewritten, io=table.io))
+    with _FakeRewriteFiles(operation=Operation.OVERWRITE, transaction=tx, io=table.io) as rewrite:
+        rewrite.delete_data_file(data_file)
+        for new_file in new_files:
+            rewrite.append_data_file(new_file)
+    tx.commit_transaction()
+
+
+def test_row_delta_refuses_in_transaction_rebase_over_concurrent_rewrite(catalog: Catalog) -> None:
+    # commit_transaction retries a lost race by rebasing the producer onto the refreshed head.
+    # The stock validation only looks for concurrently ADDED data files (APPEND/OVERWRITE), so
+    # a REPLACE that rewrote the referenced file would pass, and the rebased position deletes
+    # would name a dead path: every "deleted" row comes back. A row delta is only valid against
+    # the snapshot it was planned on, so the caller has to re-plan instead.
+    identifier = "default.test_row_delta_refuses_rebase_over_rewrite"
+    table = _create_v2_table(catalog, identifier)
+    data_file = _append_initial_rows(table)
+    delete_file = write_position_delete_file(table.io, table.metadata, data_file, [0, 2])
+
+    tx = table.transaction()
+    with tx.update_snapshot().row_delta() as row_delta:
+        row_delta.append_delete_file(delete_file)
+    _rewrite_data_file(catalog.load_table(identifier), data_file)
+
+    with pytest.raises(ValidationException, match="re-plan"):
+        tx.commit_transaction()
+
+    reloaded = catalog.load_table(identifier)
+    current_snapshot = reloaded.current_snapshot()
+    assert current_snapshot is not None
+    assert current_snapshot.summary is not None
+    assert current_snapshot.summary.operation == Operation.REPLACE
+    assert _rows(reloaded) == [
+        {"id": 1, "data": "a"},
+        {"id": 2, "data": "b"},
+        {"id": 3, "data": "c"},
+        {"id": 4, "data": "d"},
+    ]
